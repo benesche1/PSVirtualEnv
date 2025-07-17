@@ -1,0 +1,529 @@
+# PSVirtualEnv/PSVirtualEnv.psd1
+@{
+    # Module manifest for PSVirtualEnv
+    RootModule = 'PSVirtualEnv.psm1'
+    ModuleVersion = '1.0.0'
+    GUID = 'a8b9c3d4-5e6f-7a8b-9c0d-1e2f3a4b5c6d'
+    Author = 'PSVirtualEnv Development Team'
+    CompanyName = 'Community'
+    Copyright = '(c) 2024 PSVirtualEnv Development Team. All rights reserved.'
+    Description = 'PowerShell Virtual Environment Manager - Create isolated PowerShell module environments'
+    PowerShellVersion = '5.1'
+    
+    # Functions to export
+    FunctionsToExport = @(
+        'New-PSVirtualEnv',
+        'Remove-PSVirtualEnv',
+        'Activate-PSVirtualEnv',
+        'Deactivate-PSVirtualEnv',
+        'Get-PSVirtualEnv',
+        'Install-PSModuleInEnv',
+        'Uninstall-PSModuleInEnv',
+        'Get-PSModuleInEnv',
+        'Update-PSModuleInEnv'
+    )
+    
+    # Cmdlets to export
+    CmdletsToExport = @()
+    
+    # Variables to export
+    VariablesToExport = @()
+    
+    # Aliases to export
+    AliasesToExport = @()
+    
+    # Private data
+    PrivateData = @{
+        PSData = @{
+            Tags = @('VirtualEnvironment', 'ModuleManagement', 'Development', 'Isolation')
+            LicenseUri = 'https://github.com/psvirtualenv/psvirtualenv/blob/main/LICENSE'
+            ProjectUri = 'https://github.com/psvirtualenv/psvirtualenv'
+            IconUri = ''
+            ReleaseNotes = 'Initial release of PSVirtualEnv module'
+        }
+    }
+}
+
+# PSVirtualEnv/PSVirtualEnv.psm1
+#Requires -Version 5.1
+
+# Module variables
+$script:ActiveEnvironment = $null
+$script:OriginalPSModulePath = $null
+$script:OriginalPromptFunction = $null
+$script:PSVirtualEnvHome = Join-Path $env:USERPROFILE '.psvirtualenv'
+
+# Import classes
+. $PSScriptRoot\Classes\PSVirtualEnvironment.ps1
+
+# Import private functions
+Get-ChildItem -Path $PSScriptRoot\Private\*.ps1 | ForEach-Object {
+    . $_.FullName
+}
+
+# Import public functions
+Get-ChildItem -Path $PSScriptRoot\Public\*.ps1 | ForEach-Object {
+    . $_.FullName
+}
+
+# Initialize module
+if (-not (Test-Path $script:PSVirtualEnvHome)) {
+    New-Item -Path $script:PSVirtualEnvHome -ItemType Directory -Force | Out-Null
+}
+
+$script:RegistryPath = Join-Path $script:PSVirtualEnvHome 'registry.json'
+if (-not (Test-Path $script:RegistryPath)) {
+    @() | ConvertTo-Json | Set-Content -Path $script:RegistryPath -Encoding UTF8
+}
+
+# Export module members
+Export-ModuleMember -Function $publicFunctions
+
+# PSVirtualEnv/Classes/PSVirtualEnvironment.ps1
+class PSVirtualEnvironment {
+    [string]$Name
+    [string]$Path
+    [datetime]$Created
+    [string]$Description
+    [bool]$IsActive
+    [hashtable]$Settings
+    [System.Collections.ArrayList]$Modules
+    
+    PSVirtualEnvironment() {
+        $this.Modules = [System.Collections.ArrayList]::new()
+        $this.Settings = @{
+            includeSystemModules = $false
+            autoActivate = $false
+        }
+    }
+    
+    PSVirtualEnvironment([string]$name, [string]$path) {
+        $this.Name = $name
+        $this.Path = $path
+        $this.Created = Get-Date
+        $this.IsActive = $false
+        $this.Modules = [System.Collections.ArrayList]::new()
+        $this.Settings = @{
+            includeSystemModules = $false
+            autoActivate = $false
+        }
+    }
+    
+    [void] AddModule([string]$name, [string]$version) {
+        $moduleInfo = @{
+            name = $name
+            version = $version
+            installed = Get-Date
+        }
+        $this.Modules.Add($moduleInfo) | Out-Null
+    }
+    
+    [void] RemoveModule([string]$name) {
+        $this.Modules.RemoveAll({ param($m) $m.name -eq $name }) | Out-Null
+    }
+    
+    [hashtable] ToHashtable() {
+        return @{
+            name = $this.Name
+            path = $this.Path
+            created = $this.Created.ToString('o')
+            description = $this.Description
+            modules = $this.Modules
+            settings = $this.Settings
+        }
+    }
+    
+    static [PSVirtualEnvironment] FromHashtable([hashtable]$data) {
+        $env = [PSVirtualEnvironment]::new()
+        $env.Name = $data.name
+        $env.Path = $data.path
+        $env.Created = [datetime]::Parse($data.created)
+        $env.Description = $data.description
+        $env.Settings = $data.settings
+        if ($data.modules) {
+            $env.Modules = [System.Collections.ArrayList]$data.modules
+        }
+        return $env
+    }
+}
+
+# PSVirtualEnv/Data/DefaultConfig.json
+{
+    "name": "",
+    "path": "",
+    "created": "",
+    "description": "",
+    "modules": [],
+    "settings": {
+        "includeSystemModules": false,
+        "autoActivate": false
+    }
+}
+
+# PSVirtualEnv/Private/PathManager.ps1
+function Get-SystemModulePaths {
+    <#
+    .SYNOPSIS
+        Gets the system module paths from PSModulePath.
+    
+    .DESCRIPTION
+        Returns an array of system module paths, excluding user-specific paths.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param()
+    
+    $paths = $env:PSModulePath -split [IO.Path]::PathSeparator
+    $userPath = Join-Path $env:USERPROFILE 'Documents\PowerShell\Modules'
+    $userPathWin = Join-Path $env:USERPROFILE 'Documents\WindowsPowerShell\Modules'
+    
+    $systemPaths = $paths | Where-Object {
+        $_ -ne $userPath -and $_ -ne $userPathWin -and $_ -notlike "*$env:USERNAME*"
+    }
+    
+    return $systemPaths
+}
+
+function Set-PSModulePathForEnvironment {
+    <#
+    .SYNOPSIS
+        Sets the PSModulePath for the active environment.
+    
+    .DESCRIPTION
+        Modifies the PSModulePath to prioritize the virtual environment's module directory.
+    
+    .PARAMETER EnvironmentPath
+        The path to the virtual environment.
+    
+    .PARAMETER IncludeSystemModules
+        Whether to include system module paths.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$EnvironmentPath,
+        
+        [switch]$IncludeSystemModules
+    )
+    
+    $envModulePath = Join-Path $EnvironmentPath 'Modules'
+    
+    if ($IncludeSystemModules) {
+        $systemPaths = Get-SystemModulePaths
+        $newPath = @($envModulePath) + $systemPaths
+    } else {
+        # Only include the environment path and minimal system paths
+        $programFilesPath = Join-Path $env:ProgramFiles 'PowerShell\Modules'
+        $programFilesPath86 = Join-Path ${env:ProgramFiles(x86)} 'PowerShell\Modules'
+        $winPSPath = Join-Path $env:windir 'system32\WindowsPowerShell\v1.0\Modules'
+        
+        $newPath = @($envModulePath, $programFilesPath, $programFilesPath86, $winPSPath) | Where-Object { Test-Path $_ }
+    }
+    
+    $env:PSModulePath = $newPath -join [IO.Path]::PathSeparator
+}
+
+function Restore-OriginalPSModulePath {
+    <#
+    .SYNOPSIS
+        Restores the original PSModulePath.
+    
+    .DESCRIPTION
+        Restores the PSModulePath to its state before environment activation.
+    #>
+    [CmdletBinding()]
+    param()
+    
+    if ($script:OriginalPSModulePath) {
+        $env:PSModulePath = $script:OriginalPSModulePath
+        $script:OriginalPSModulePath = $null
+    }
+}
+
+# PSVirtualEnv/Private/ConfigManager.ps1
+function Get-EnvironmentRegistry {
+    <#
+    .SYNOPSIS
+        Gets the global environment registry.
+    
+    .DESCRIPTION
+        Reads and returns the global registry of all virtual environments.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable[]])]
+    param()
+    
+    $registryPath = $script:RegistryPath
+    
+    if (Test-Path $registryPath) {
+        try {
+            $content = Get-Content -Path $registryPath -Raw -ErrorAction Stop
+            if ([string]::IsNullOrWhiteSpace($content)) {
+                return @()
+            }
+            return $content | ConvertFrom-Json -AsHashtable
+        } catch {
+            Write-Warning "Failed to read environment registry: $_"
+            return @()
+        }
+    }
+    
+    return @()
+}
+
+function Set-EnvironmentRegistry {
+    <#
+    .SYNOPSIS
+        Sets the global environment registry.
+    
+    .DESCRIPTION
+        Writes the global registry of all virtual environments.
+    
+    .PARAMETER Registry
+        The registry data to write.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [hashtable[]]$Registry
+    )
+    
+    try {
+        $Registry | ConvertTo-Json -Depth 10 | Set-Content -Path $script:RegistryPath -Encoding UTF8 -ErrorAction Stop
+    } catch {
+        Write-Error "Failed to write environment registry: $_"
+    }
+}
+
+function Add-EnvironmentToRegistry {
+    <#
+    .SYNOPSIS
+        Adds an environment to the global registry.
+    
+    .PARAMETER Environment
+        The environment object to add.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [PSVirtualEnvironment]$Environment
+    )
+    
+    $registry = Get-EnvironmentRegistry
+    
+    # Remove existing entry if present
+    $registry = $registry | Where-Object { $_.name -ne $Environment.Name }
+    
+    # Add new entry
+    $registry += $Environment.ToHashtable()
+    
+    Set-EnvironmentRegistry -Registry $registry
+}
+
+function Remove-EnvironmentFromRegistry {
+    <#
+    .SYNOPSIS
+        Removes an environment from the global registry.
+    
+    .PARAMETER Name
+        The name of the environment to remove.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
+    
+    $registry = Get-EnvironmentRegistry
+    $registry = $registry | Where-Object { $_.name -ne $Name }
+    Set-EnvironmentRegistry -Registry $registry
+}
+
+function Get-EnvironmentConfig {
+    <#
+    .SYNOPSIS
+        Gets the configuration for a specific environment.
+    
+    .PARAMETER Path
+        The path to the environment.
+    #>
+    [CmdletBinding()]
+    [OutputType([PSVirtualEnvironment])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+    
+    $configPath = Join-Path $Path 'config.json'
+    
+    if (Test-Path $configPath) {
+        try {
+            $content = Get-Content -Path $configPath -Raw -ErrorAction Stop
+            $data = $content | ConvertFrom-Json -AsHashtable
+            return [PSVirtualEnvironment]::FromHashtable($data)
+        } catch {
+            Write-Error "Failed to read environment configuration: $_"
+            return $null
+        }
+    }
+    
+    return $null
+}
+
+function Set-EnvironmentConfig {
+    <#
+    .SYNOPSIS
+        Sets the configuration for a specific environment.
+    
+    .PARAMETER Environment
+        The environment object to save.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [PSVirtualEnvironment]$Environment
+    )
+    
+    $configPath = Join-Path $Environment.Path 'config.json'
+    
+    try {
+        $Environment.ToHashtable() | ConvertTo-Json -Depth 10 | Set-Content -Path $configPath -Encoding UTF8 -ErrorAction Stop
+    } catch {
+        Write-Error "Failed to write environment configuration: $_"
+    }
+}
+
+# PSVirtualEnv/Private/ValidationHelpers.ps1
+function Test-EnvironmentName {
+    <#
+    .SYNOPSIS
+        Validates an environment name.
+    
+    .DESCRIPTION
+        Checks if the environment name is valid and doesn't conflict with existing environments.
+    
+    .PARAMETER Name
+        The name to validate.
+    
+    .PARAMETER CheckExists
+        Whether to check if the environment already exists.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name,
+        
+        [switch]$CheckExists
+    )
+    
+    # Check for invalid characters
+    if ($Name -match '[<>:"/\\|?*]') {
+        Write-Error "Environment name contains invalid characters. Please use only letters, numbers, hyphens, and underscores."
+        return $false
+    }
+    
+    # Check length
+    if ($Name.Length -lt 1 -or $Name.Length -gt 50) {
+        Write-Error "Environment name must be between 1 and 50 characters."
+        return $false
+    }
+    
+    # Check if exists
+    if ($CheckExists) {
+        $registry = Get-EnvironmentRegistry
+        if ($registry | Where-Object { $_.name -eq $Name }) {
+            Write-Error "Environment '$Name' already exists. Use -Force to overwrite."
+            return $false
+        }
+    }
+    
+    return $true
+}
+
+function Test-EnvironmentPath {
+    <#
+    .SYNOPSIS
+        Validates an environment path.
+    
+    .DESCRIPTION
+        Checks if the path is valid for creating an environment.
+    
+    .PARAMETER Path
+        The path to validate.
+    
+    .PARAMETER CreateIfNotExist
+        Whether to create the path if it doesn't exist.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+        
+        [switch]$CreateIfNotExist
+    )
+    
+    try {
+        $resolvedPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+        
+        if (Test-Path $resolvedPath) {
+            $item = Get-Item $resolvedPath
+            if (-not $item.PSIsContainer) {
+                Write-Error "Path '$Path' exists but is not a directory."
+                return $false
+            }
+            
+            # Check if directory is empty
+            if ((Get-ChildItem $resolvedPath -Force | Measure-Object).Count -gt 0) {
+                Write-Error "Directory '$Path' is not empty. Use -Force to overwrite."
+                return $false
+            }
+        } elseif ($CreateIfNotExist) {
+            try {
+                New-Item -Path $resolvedPath -ItemType Directory -Force | Out-Null
+            } catch {
+                Write-Error "Failed to create directory '$Path': $_"
+                return $false
+            }
+        } else {
+            Write-Error "Path '$Path' does not exist."
+            return $false
+        }
+        
+        return $true
+    } catch {
+        Write-Error "Invalid path '$Path': $_"
+        return $false
+    }
+}
+
+function Test-EnvironmentActive {
+    <#
+    .SYNOPSIS
+        Checks if a virtual environment is currently active.
+    
+    .DESCRIPTION
+        Returns true if an environment is active, false otherwise.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+    
+    return $null -ne $script:ActiveEnvironment
+}
+
+function Get-ActiveEnvironment {
+    <#
+    .SYNOPSIS
+        Gets the currently active environment.
+    
+    .DESCRIPTION
+        Returns the active environment object or null if none is active.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param()
+    
+    return $script:ActiveEnvironment
+}

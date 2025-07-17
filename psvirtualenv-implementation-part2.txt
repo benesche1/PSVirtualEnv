@@ -1,0 +1,556 @@
+# PSVirtualEnv/Public/New-PSVirtualEnv.ps1
+function New-PSVirtualEnv {
+    <#
+    .SYNOPSIS
+        Creates a new PowerShell virtual environment.
+    
+    .DESCRIPTION
+        Creates a new isolated PowerShell virtual environment with its own module directory
+        and configuration. The environment can be activated to isolate module installations.
+    
+    .PARAMETER Name
+        Name of the virtual environment. Must be unique and contain only valid characters.
+    
+    .PARAMETER Path
+        Custom path for the environment. Defaults to $env:USERPROFILE\.psvirtualenv\{Name}
+    
+    .PARAMETER CopySystemModules
+        Include system modules in the environment. This copies core PowerShell modules.
+    
+    .PARAMETER BaseEnvironment
+        Copy modules from another PSVirtualEnv as a starting point.
+    
+    .PARAMETER Force
+        Overwrite existing environment if it exists.
+    
+    .PARAMETER Description
+        Description of the environment for documentation purposes.
+    
+    .EXAMPLE
+        New-PSVirtualEnv -Name "WebProject" -Description "Environment for web development modules"
+        Creates a new environment named "WebProject" with a description.
+    
+    .EXAMPLE
+        New-PSVirtualEnv -Name "Testing" -Path "C:\Projects\TestEnv" -CopySystemModules
+        Creates a new environment at a custom path and includes system modules.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([PSVirtualEnvironment])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Name,
+        
+        [Parameter()]
+        [string]$Path,
+        
+        [Parameter()]
+        [switch]$CopySystemModules,
+        
+        [Parameter()]
+        [string]$BaseEnvironment,
+        
+        [Parameter()]
+        [switch]$Force,
+        
+        [Parameter()]
+        [string]$Description
+    )
+    
+    begin {
+        Write-Verbose "Creating new PowerShell virtual environment: $Name"
+    }
+    
+    process {
+        # Validate environment name
+        if (-not (Test-EnvironmentName -Name $Name -CheckExists:(-not $Force))) {
+            return
+        }
+        
+        # Set default path if not provided
+        if ([string]::IsNullOrWhiteSpace($Path)) {
+            $Path = Join-Path $script:PSVirtualEnvHome $Name
+        }
+        
+        # Resolve and validate path
+        $resolvedPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+        
+        # Handle existing environment
+        if (Test-Path $resolvedPath) {
+            if (-not $Force) {
+                Write-Error "Environment path '$resolvedPath' already exists. Use -Force to overwrite."
+                return
+            }
+            
+            if ($PSCmdlet.ShouldProcess($resolvedPath, "Remove existing environment")) {
+                Remove-Item -Path $resolvedPath -Recurse -Force -ErrorAction Stop
+            }
+        }
+        
+        if ($PSCmdlet.ShouldProcess($Name, "Create virtual environment")) {
+            try {
+                # Create directory structure
+                $directories = @(
+                    $resolvedPath,
+                    (Join-Path $resolvedPath 'Modules'),
+                    (Join-Path $resolvedPath 'Scripts'),
+                    (Join-Path $resolvedPath 'Cache'),
+                    (Join-Path $resolvedPath 'Logs')
+                )
+                
+                foreach ($dir in $directories) {
+                    New-Item -Path $dir -ItemType Directory -Force | Out-Null
+                }
+                
+                # Create environment object
+                $environment = [PSVirtualEnvironment]::new($Name, $resolvedPath)
+                $environment.Description = $Description
+                $environment.Settings.includeSystemModules = $CopySystemModules.IsPresent
+                
+                # Copy from base environment if specified
+                if ($BaseEnvironment) {
+                    Write-Verbose "Copying modules from base environment: $BaseEnvironment"
+                    $baseEnv = Get-EnvironmentFromRegistry -Name $BaseEnvironment
+                    
+                    if (-not $baseEnv) {
+                        Write-Error "Base environment '$BaseEnvironment' not found."
+                        return
+                    }
+                    
+                    $baseModulesPath = Join-Path $baseEnv.path 'Modules'
+                    $targetModulesPath = Join-Path $resolvedPath 'Modules'
+                    
+                    if (Test-Path $baseModulesPath) {
+                        Copy-Item -Path "$baseModulesPath\*" -Destination $targetModulesPath -Recurse -Force
+                        
+                        # Update module list in configuration
+                        foreach ($module in $baseEnv.modules) {
+                            $environment.AddModule($module.name, $module.version)
+                        }
+                    }
+                }
+                
+                # Copy system modules if requested
+                if ($CopySystemModules) {
+                    Write-Verbose "Copying system modules to environment"
+                    $systemModules = @('Microsoft.PowerShell.*', 'PSReadLine', 'PowerShellGet', 'PackageManagement')
+                    $systemPaths = Get-SystemModulePaths
+                    
+                    foreach ($pattern in $systemModules) {
+                        foreach ($sysPath in $systemPaths) {
+                            if (Test-Path $sysPath) {
+                                $modules = Get-ChildItem -Path $sysPath -Directory -Filter $pattern -ErrorAction SilentlyContinue
+                                foreach ($module in $modules) {
+                                    $targetPath = Join-Path $resolvedPath "Modules\$($module.Name)"
+                                    if (-not (Test-Path $targetPath)) {
+                                        Copy-Item -Path $module.FullName -Destination $targetPath -Recurse -Force
+                                        $moduleVersion = (Get-Module -Name $module.Name -ListAvailable | Select-Object -First 1).Version.ToString()
+                                        $environment.AddModule($module.Name, $moduleVersion)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                # Save environment configuration
+                Set-EnvironmentConfig -Environment $environment
+                
+                # Add to registry
+                Add-EnvironmentToRegistry -Environment $environment
+                
+                Write-Information "Successfully created virtual environment '$Name' at '$resolvedPath'" -InformationAction Continue
+                
+                return $environment
+                
+            } catch {
+                Write-Error "Failed to create virtual environment: $_"
+                if (Test-Path $resolvedPath) {
+                    Remove-Item -Path $resolvedPath -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+    }
+}
+
+# PSVirtualEnv/Public/Remove-PSVirtualEnv.ps1
+function Remove-PSVirtualEnv {
+    <#
+    .SYNOPSIS
+        Removes an existing PowerShell virtual environment.
+    
+    .DESCRIPTION
+        Removes a PowerShell virtual environment and all its contents, including installed modules.
+        The environment must not be currently active.
+    
+    .PARAMETER Name
+        Name of the environment to remove.
+    
+    .PARAMETER Force
+        Skip confirmation prompt and force removal.
+    
+    .EXAMPLE
+        Remove-PSVirtualEnv -Name "OldProject"
+        Removes the environment named "OldProject" with confirmation.
+    
+    .EXAMPLE
+        Remove-PSVirtualEnv -Name "Testing" -Force
+        Removes the environment named "Testing" without confirmation.
+    #>
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Name,
+        
+        [Parameter()]
+        [switch]$Force
+    )
+    
+    begin {
+        Write-Verbose "Removing PowerShell virtual environment: $Name"
+    }
+    
+    process {
+        # Get environment from registry
+        $environment = Get-EnvironmentFromRegistry -Name $Name
+        
+        if (-not $environment) {
+            Write-Error "Environment '$Name' not found. Use Get-PSVirtualEnv to list available environments."
+            return
+        }
+        
+        # Check if environment is currently active
+        if (Test-EnvironmentActive) {
+            $activeEnv = Get-ActiveEnvironment
+            if ($activeEnv.Name -eq $Name) {
+                Write-Error "Cannot remove currently active environment '$Name'. Please deactivate it first using Deactivate-PSVirtualEnv."
+                return
+            }
+        }
+        
+        # Confirm removal unless Force is specified
+        if ($Force -or $PSCmdlet.ShouldProcess($Name, "Remove virtual environment")) {
+            try {
+                # Remove environment directory
+                if (Test-Path $environment.path) {
+                    Remove-Item -Path $environment.path -Recurse -Force -ErrorAction Stop
+                    Write-Verbose "Removed environment directory: $($environment.path)"
+                }
+                
+                # Remove from registry
+                Remove-EnvironmentFromRegistry -Name $Name
+                Write-Verbose "Removed environment from registry"
+                
+                Write-Information "Successfully removed virtual environment '$Name'" -InformationAction Continue
+                
+            } catch {
+                Write-Error "Failed to remove virtual environment: $_"
+            }
+        }
+    }
+}
+
+function Get-EnvironmentFromRegistry {
+    param([string]$Name)
+    
+    $registry = Get-EnvironmentRegistry
+    $envData = $registry | Where-Object { $_.name -eq $Name } | Select-Object -First 1
+    
+    if ($envData) {
+        return [PSVirtualEnvironment]::FromHashtable($envData)
+    }
+    
+    return $null
+}
+
+# PSVirtualEnv/Public/Activate-PSVirtualEnv.ps1
+function Activate-PSVirtualEnv {
+    <#
+    .SYNOPSIS
+        Activates a PowerShell virtual environment in the current session.
+    
+    .DESCRIPTION
+        Activates a PowerShell virtual environment by modifying the PSModulePath to prioritize
+        the environment's module directory. Also updates the prompt to show the active environment.
+    
+    .PARAMETER Name
+        Name of the environment to activate.
+    
+    .PARAMETER Scope
+        Scope of activation (Session, Global). Defaults to Session.
+        Note: Global scope is not recommended as it affects all PowerShell sessions.
+    
+    .EXAMPLE
+        Activate-PSVirtualEnv -Name "WebProject"
+        Activates the "WebProject" environment in the current session.
+    
+    .EXAMPLE
+        Activate-PSVirtualEnv -Name "Testing" -Scope Global
+        Activates the "Testing" environment globally (not recommended).
+    #>
+    [CmdletBinding()]
+    [OutputType([void])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Name,
+        
+        [Parameter()]
+        [ValidateSet('Session', 'Global')]
+        [string]$Scope = 'Session'
+    )
+    
+    begin {
+        Write-Verbose "Activating PowerShell virtual environment: $Name"
+    }
+    
+    process {
+        # Check if another environment is already active
+        if (Test-EnvironmentActive) {
+            $activeEnv = Get-ActiveEnvironment
+            Write-Warning "Environment '$($activeEnv.Name)' is currently active. Deactivating it first."
+            Deactivate-PSVirtualEnv
+        }
+        
+        # Get environment from registry
+        $environment = Get-EnvironmentFromRegistry -Name $Name
+        
+        if (-not $environment) {
+            Write-Error "Environment '$Name' not found. Use Get-PSVirtualEnv to list available environments."
+            return
+        }
+        
+        # Verify environment path exists
+        if (-not (Test-Path $environment.Path)) {
+            Write-Error "Environment path '$($environment.Path)' does not exist. The environment may be corrupted."
+            return
+        }
+        
+        try {
+            # Store original PSModulePath
+            $script:OriginalPSModulePath = $env:PSModulePath
+            Write-Verbose "Stored original PSModulePath"
+            
+            # Set new PSModulePath
+            Set-PSModulePathForEnvironment -EnvironmentPath $environment.Path -IncludeSystemModules:$environment.Settings.includeSystemModules
+            Write-Verbose "Updated PSModulePath for environment"
+            
+            # Store original prompt function
+            $script:OriginalPromptFunction = (Get-Command prompt -ErrorAction SilentlyContinue).ScriptBlock
+            
+            # Update prompt to show active environment
+            $promptFunction = {
+                if ($script:ActiveEnvironment) {
+                    Write-Host "($($script:ActiveEnvironment.Name)) " -NoNewline -ForegroundColor Green
+                }
+                if ($script:OriginalPromptFunction) {
+                    & $script:OriginalPromptFunction
+                } else {
+                    "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "
+                }
+            }
+            
+            Set-Item -Path function:prompt -Value $promptFunction
+            Write-Verbose "Updated prompt function"
+            
+            # Set active environment
+            $script:ActiveEnvironment = @{
+                Name = $environment.Name
+                Path = $environment.Path
+                OriginalPath = $script:OriginalPSModulePath
+            }
+            
+            # Log activation
+            $logPath = Join-Path $environment.Path "Logs\activation.log"
+            $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Environment activated by $env:USERNAME"
+            Add-Content -Path $logPath -Value $logEntry -ErrorAction SilentlyContinue
+            
+            Write-Information "Successfully activated virtual environment '$Name'" -InformationAction Continue
+            Write-Information "Module installations will now be isolated to this environment" -InformationAction Continue
+            
+        } catch {
+            Write-Error "Failed to activate virtual environment: $_"
+            
+            # Rollback changes
+            if ($script:OriginalPSModulePath) {
+                $env:PSModulePath = $script:OriginalPSModulePath
+                $script:OriginalPSModulePath = $null
+            }
+            $script:ActiveEnvironment = $null
+        }
+    }
+}
+
+# PSVirtualEnv/Public/Deactivate-PSVirtualEnv.ps1
+function Deactivate-PSVirtualEnv {
+    <#
+    .SYNOPSIS
+        Deactivates the currently active PowerShell virtual environment.
+    
+    .DESCRIPTION
+        Deactivates the currently active PowerShell virtual environment by restoring
+        the original PSModulePath and prompt function.
+    
+    .EXAMPLE
+        Deactivate-PSVirtualEnv
+        Deactivates the currently active environment.
+    #>
+    [CmdletBinding()]
+    [OutputType([void])]
+    param()
+    
+    begin {
+        Write-Verbose "Deactivating PowerShell virtual environment"
+    }
+    
+    process {
+        # Check if any environment is active
+        if (-not (Test-EnvironmentActive)) {
+            Write-Warning "No virtual environment is currently active."
+            return
+        }
+        
+        $activeEnv = Get-ActiveEnvironment
+        
+        try {
+            # Restore original PSModulePath
+            Restore-OriginalPSModulePath
+            Write-Verbose "Restored original PSModulePath"
+            
+            # Restore original prompt function
+            if ($script:OriginalPromptFunction) {
+                Set-Item -Path function:prompt -Value $script:OriginalPromptFunction
+                $script:OriginalPromptFunction = $null
+                Write-Verbose "Restored original prompt function"
+            } else {
+                # Set default prompt if no original was stored
+                Set-Item -Path function:prompt -Value {
+                    "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "
+                }
+            }
+            
+            # Log deactivation
+            $environment = Get-EnvironmentFromRegistry -Name $activeEnv.Name
+            if ($environment) {
+                $logPath = Join-Path $environment.Path "Logs\activation.log"
+                $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Environment deactivated by $env:USERNAME"
+                Add-Content -Path $logPath -Value $logEntry -ErrorAction SilentlyContinue
+            }
+            
+            # Clear active environment
+            $envName = $script:ActiveEnvironment.Name
+            $script:ActiveEnvironment = $null
+            
+            Write-Information "Successfully deactivated virtual environment '$envName'" -InformationAction Continue
+            
+        } catch {
+            Write-Error "Failed to deactivate virtual environment: $_"
+        }
+    }
+}
+
+# PSVirtualEnv/Public/Get-PSVirtualEnv.ps1
+function Get-PSVirtualEnv {
+    <#
+    .SYNOPSIS
+        Lists PowerShell virtual environments.
+    
+    .DESCRIPTION
+        Lists all PowerShell virtual environments or filters by specific criteria.
+        Shows environment names, paths, creation dates, and active status.
+    
+    .PARAMETER Name
+        Filter by specific environment name. Supports wildcards.
+    
+    .PARAMETER Active
+        Show only the currently active environment.
+    
+    .PARAMETER Detailed
+        Show detailed information including installed modules and settings.
+    
+    .EXAMPLE
+        Get-PSVirtualEnv
+        Lists all virtual environments.
+    
+    .EXAMPLE
+        Get-PSVirtualEnv -Active
+        Shows only the currently active environment.
+    
+    .EXAMPLE
+        Get-PSVirtualEnv -Name "Web*" -Detailed
+        Shows detailed information for all environments starting with "Web".
+    #>
+    [CmdletBinding(DefaultParameterSetName = 'List')]
+    [OutputType([PSVirtualEnvironment[]])]
+    param(
+        [Parameter(Position = 0, ParameterSetName = 'List')]
+        [SupportsWildcards()]
+        [string]$Name,
+        
+        [Parameter(ParameterSetName = 'Active')]
+        [switch]$Active,
+        
+        [Parameter()]
+        [switch]$Detailed
+    )
+    
+    begin {
+        Write-Verbose "Getting PowerShell virtual environments"
+    }
+    
+    process {
+        # Get all environments from registry
+        $registry = Get-EnvironmentRegistry
+        $environments = @()
+        
+        foreach ($envData in $registry) {
+            $env = [PSVirtualEnvironment]::FromHashtable($envData)
+            
+            # Check if this is the active environment
+            if (Test-EnvironmentActive) {
+                $activeEnv = Get-ActiveEnvironment
+                $env.IsActive = ($activeEnv.Name -eq $env.Name)
+            }
+            
+            $environments += $env
+        }
+        
+        # Filter by parameter set
+        if ($Active) {
+            $environments = $environments | Where-Object { $_.IsActive }
+            if ($environments.Count -eq 0) {
+                Write-Warning "No virtual environment is currently active."
+                return
+            }
+        } elseif ($Name) {
+            $environments = $environments | Where-Object { $_.Name -like $Name }
+            if ($environments.Count -eq 0) {
+                Write-Warning "No environments found matching pattern '$Name'."
+                return
+            }
+        }
+        
+        # Output based on detail level
+        if ($Detailed) {
+            # Return full objects
+            $environments
+        } else {
+            # Return formatted summary
+            $environments | ForEach-Object {
+                $output = [PSCustomObject]@{
+                    Name = $_.Name
+                    Path = $_.Path
+                    Created = $_.Created
+                    IsActive = $_.IsActive
+                    ModuleCount = $_.Modules.Count
+                    Description = $_.Description
+                }
+                
+                # Add type name for formatting
+                $output.PSObject.TypeNames.Insert(0, 'PSVirtualEnv.Summary')
+                $output
+            }
+        }
+    }
+}

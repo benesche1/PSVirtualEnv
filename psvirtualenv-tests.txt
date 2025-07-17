@@ -1,0 +1,372 @@
+# PSVirtualEnv/Tests/PSVirtualEnv.Tests.ps1
+#Requires -Module Pester
+
+BeforeAll {
+    # Import the module
+    $ModulePath = Join-Path (Split-Path $PSScriptRoot -Parent) 'PSVirtualEnv.psd1'
+    Import-Module $ModulePath -Force
+    
+    # Set up test environment path
+    $script:TestEnvironmentPath = Join-Path $env:TEMP "PSVirtualEnvTests_$(New-Guid)"
+    $script:TestEnvironmentName = "TestEnv_$(Get-Random -Maximum 9999)"
+    
+    # Store original values
+    $script:OriginalPSModulePath = $env:PSModulePath
+    $script:OriginalPSVirtualEnvHome = if (Get-Variable -Name PSVirtualEnvHome -Scope Script -ErrorAction SilentlyContinue) { 
+        $script:PSVirtualEnvHome 
+    } else { 
+        $null 
+    }
+    
+    # Mock home directory for tests
+    Mock -ModuleName PSVirtualEnv Join-Path {
+        if ($Path -eq $env:USERPROFILE -and $ChildPath -eq '.psvirtualenv') {
+            return $script:TestEnvironmentPath
+        }
+        Microsoft.PowerShell.Management\Join-Path @PSBoundParameters
+    }
+}
+
+AfterAll {
+    # Cleanup
+    if (Test-Path $script:TestEnvironmentPath) {
+        Remove-Item -Path $script:TestEnvironmentPath -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    
+    # Restore original values
+    $env:PSModulePath = $script:OriginalPSModulePath
+    
+    # Remove module
+    Remove-Module PSVirtualEnv -Force -ErrorAction SilentlyContinue
+}
+
+Describe 'PSVirtualEnv Module' {
+    Context 'Module Import' {
+        It 'Should import successfully' {
+            Get-Module PSVirtualEnv | Should -Not -BeNullOrEmpty
+        }
+        
+        It 'Should export expected commands' {
+            $commands = Get-Command -Module PSVirtualEnv
+            $expectedCommands = @(
+                'New-PSVirtualEnv',
+                'Remove-PSVirtualEnv',
+                'Activate-PSVirtualEnv',
+                'Deactivate-PSVirtualEnv',
+                'Get-PSVirtualEnv',
+                'Install-PSModuleInEnv',
+                'Uninstall-PSModuleInEnv',
+                'Get-PSModuleInEnv',
+                'Update-PSModuleInEnv'
+            )
+            
+            $commands.Name | Should -Contain $expectedCommands
+        }
+    }
+}
+
+Describe 'New-PSVirtualEnv' {
+    BeforeEach {
+        # Ensure test environment directory exists
+        if (-not (Test-Path $script:TestEnvironmentPath)) {
+            New-Item -Path $script:TestEnvironmentPath -ItemType Directory -Force | Out-Null
+        }
+        
+        # Initialize registry
+        $registryPath = Join-Path $script:TestEnvironmentPath 'registry.json'
+        @() | ConvertTo-Json | Set-Content -Path $registryPath -Encoding UTF8
+    }
+    
+    AfterEach {
+        # Clean up any created environments
+        $envPath = Join-Path $script:TestEnvironmentPath $script:TestEnvironmentName
+        if (Test-Path $envPath) {
+            Remove-Item -Path $envPath -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    
+    Context 'Creating new environments' {
+        It 'Should create a new environment with default settings' {
+            $result = New-PSVirtualEnv -Name $script:TestEnvironmentName
+            
+            $result | Should -Not -BeNullOrEmpty
+            $result.Name | Should -Be $script:TestEnvironmentName
+            $result.Path | Should -BeLike "*$script:TestEnvironmentName"
+            
+            # Check directory structure
+            $envPath = $result.Path
+            Test-Path $envPath | Should -BeTrue
+            Test-Path (Join-Path $envPath 'Modules') | Should -BeTrue
+            Test-Path (Join-Path $envPath 'Scripts') | Should -BeTrue
+            Test-Path (Join-Path $envPath 'Cache') | Should -BeTrue
+            Test-Path (Join-Path $envPath 'Logs') | Should -BeTrue
+            Test-Path (Join-Path $envPath 'config.json') | Should -BeTrue
+        }
+        
+        It 'Should create environment with custom description' {
+            $description = "Test environment for Pester"
+            $result = New-PSVirtualEnv -Name $script:TestEnvironmentName -Description $description
+            
+            $result.Description | Should -Be $description
+        }
+        
+        It 'Should fail when environment already exists without Force' {
+            New-PSVirtualEnv -Name $script:TestEnvironmentName
+            { New-PSVirtualEnv -Name $script:TestEnvironmentName -ErrorAction Stop } | Should -Throw
+        }
+        
+        It 'Should overwrite existing environment with Force' {
+            New-PSVirtualEnv -Name $script:TestEnvironmentName
+            $result = New-PSVirtualEnv -Name $script:TestEnvironmentName -Force
+            
+            $result | Should -Not -BeNullOrEmpty
+        }
+        
+        It 'Should validate environment name' {
+            { New-PSVirtualEnv -Name 'Invalid/Name' -ErrorAction Stop } | Should -Throw
+            { New-PSVirtualEnv -Name 'Invalid:Name' -ErrorAction Stop } | Should -Throw
+            { New-PSVirtualEnv -Name '' -ErrorAction Stop } | Should -Throw
+        }
+    }
+}
+
+Describe 'Activate-PSVirtualEnv and Deactivate-PSVirtualEnv' {
+    BeforeAll {
+        # Create a test environment
+        New-PSVirtualEnv -Name $script:TestEnvironmentName -Force
+        
+        # Store original prompt
+        $script:OriginalPrompt = (Get-Command prompt -ErrorAction SilentlyContinue).ScriptBlock
+    }
+    
+    AfterAll {
+        # Ensure environment is deactivated
+        Deactivate-PSVirtualEnv -ErrorAction SilentlyContinue
+        
+        # Remove test environment
+        Remove-PSVirtualEnv -Name $script:TestEnvironmentName -Force
+        
+        # Restore original prompt
+        if ($script:OriginalPrompt) {
+            Set-Item -Path function:prompt -Value $script:OriginalPrompt
+        }
+    }
+    
+    Context 'Activating environments' {
+        It 'Should activate an existing environment' {
+            { Activate-PSVirtualEnv -Name $script:TestEnvironmentName } | Should -Not -Throw
+            
+            # Check if environment is active
+            InModuleScope PSVirtualEnv {
+                $script:ActiveEnvironment | Should -Not -BeNullOrEmpty
+                $script:ActiveEnvironment.Name | Should -Be $using:script:TestEnvironmentName
+            }
+        }
+        
+        It 'Should modify PSModulePath when activated' {
+            Activate-PSVirtualEnv -Name $script:TestEnvironmentName
+            
+            $env:PSModulePath | Should -BeLike "*$script:TestEnvironmentName\Modules*"
+        }
+        
+        It 'Should update prompt to show active environment' {
+            Activate-PSVirtualEnv -Name $script:TestEnvironmentName
+            
+            $promptOutput = & prompt
+            $promptOutput | Should -Match $script:TestEnvironmentName
+        }
+        
+        It 'Should fail when environment does not exist' {
+            { Activate-PSVirtualEnv -Name 'NonExistentEnv' -ErrorAction Stop } | Should -Throw
+        }
+    }
+    
+    Context 'Deactivating environments' {
+        BeforeEach {
+            Activate-PSVirtualEnv -Name $script:TestEnvironmentName
+        }
+        
+        It 'Should deactivate the active environment' {
+            { Deactivate-PSVirtualEnv } | Should -Not -Throw
+            
+            # Check if environment is deactivated
+            InModuleScope PSVirtualEnv {
+                $script:ActiveEnvironment | Should -BeNullOrEmpty
+            }
+        }
+        
+        It 'Should restore original PSModulePath' {
+            $originalPath = $env:PSModulePath
+            Activate-PSVirtualEnv -Name $script:TestEnvironmentName
+            $activePath = $env:PSModulePath
+            
+            $activePath | Should -Not -Be $originalPath
+            
+            Deactivate-PSVirtualEnv
+            
+            $env:PSModulePath | Should -Not -BeLike "*$script:TestEnvironmentName*"
+        }
+        
+        It 'Should warn when no environment is active' {
+            Deactivate-PSVirtualEnv  # First deactivation
+            $output = Deactivate-PSVirtualEnv -WarningAction SilentlyContinue -WarningVariable warning
+            
+            $warning | Should -Not -BeNullOrEmpty
+        }
+    }
+}
+
+Describe 'Get-PSVirtualEnv' {
+    BeforeAll {
+        # Create multiple test environments
+        $script:TestEnvNames = @('TestEnv1', 'TestEnv2', 'WebProject')
+        foreach ($name in $script:TestEnvNames) {
+            New-PSVirtualEnv -Name $name -Force
+        }
+    }
+    
+    AfterAll {
+        # Clean up test environments
+        foreach ($name in $script:TestEnvNames) {
+            Remove-PSVirtualEnv -Name $name -Force -ErrorAction SilentlyContinue
+        }
+    }
+    
+    Context 'Listing environments' {
+        It 'Should list all environments' {
+            $environments = Get-PSVirtualEnv
+            
+            $environments | Should -Not -BeNullOrEmpty
+            $environments.Count | Should -BeGreaterOrEqual 3
+            $environments.Name | Should -Contain 'TestEnv1'
+            $environments.Name | Should -Contain 'TestEnv2'
+            $environments.Name | Should -Contain 'WebProject'
+        }
+        
+        It 'Should filter by name with wildcards' {
+            $environments = Get-PSVirtualEnv -Name 'Test*'
+            
+            $environments.Count | Should -Be 2
+            $environments.Name | Should -Contain 'TestEnv1'
+            $environments.Name | Should -Contain 'TestEnv2'
+            $environments.Name | Should -Not -Contain 'WebProject'
+        }
+        
+        It 'Should show active environment' {
+            Activate-PSVirtualEnv -Name 'TestEnv1'
+            
+            try {
+                $activeEnv = Get-PSVirtualEnv -Active
+                
+                $activeEnv | Should -Not -BeNullOrEmpty
+                $activeEnv.Name | Should -Be 'TestEnv1'
+                $activeEnv.IsActive | Should -BeTrue
+            } finally {
+                Deactivate-PSVirtualEnv
+            }
+        }
+        
+        It 'Should show detailed information' {
+            $environments = Get-PSVirtualEnv -Detailed
+            
+            $environments[0].GetType().Name | Should -Be 'PSVirtualEnvironment'
+            $environments[0] | Should -HaveProperty 'Modules'
+            $environments[0] | Should -HaveProperty 'Settings'
+        }
+    }
+}
+
+Describe 'Install-PSModuleInEnv' {
+    BeforeAll {
+        # Create and activate test environment
+        New-PSVirtualEnv -Name $script:TestEnvironmentName -Force
+        Activate-PSVirtualEnv -Name $script:TestEnvironmentName
+        
+        # Mock Find-Module and Save-Module to avoid actual downloads
+        Mock -ModuleName PSVirtualEnv Find-Module {
+            [PSCustomObject]@{
+                Name = $Name
+                Version = [Version]'1.0.0'
+                Repository = 'PSGallery'
+            }
+        }
+        
+        Mock -ModuleName PSVirtualEnv Save-Module {
+            # Create a dummy module structure
+            $modulePath = Join-Path $Path "$Name\1.0.0"
+            New-Item -Path $modulePath -ItemType Directory -Force | Out-Null
+            
+            # Create a minimal module manifest
+            $manifestPath = Join-Path $modulePath "$Name.psd1"
+            @{
+                ModuleVersion = '1.0.0'
+                RootModule = "$Name.psm1"
+                FunctionsToExport = @()
+            } | Export-ModuleMember -OutputType Manifest -Path $manifestPath
+        }
+    }
+    
+    AfterAll {
+        Deactivate-PSVirtualEnv -ErrorAction SilentlyContinue
+        Remove-PSVirtualEnv -Name $script:TestEnvironmentName -Force
+    }
+    
+    Context 'Installing modules' {
+        It 'Should install a module in the active environment' {
+            { Install-PSModuleInEnv -Name 'TestModule' } | Should -Not -Throw
+            
+            # Verify module was added to configuration
+            $env = InModuleScope PSVirtualEnv {
+                Get-EnvironmentFromRegistry -Name $using:script:TestEnvironmentName
+            }
+            
+            $env.Modules | Where-Object { $_.name -eq 'TestModule' } | Should -Not -BeNullOrEmpty
+        }
+        
+        It 'Should fail when no environment is active' {
+            Deactivate-PSVirtualEnv
+            
+            { Install-PSModuleInEnv -Name 'TestModule' -ErrorAction Stop } | Should -Throw
+            
+            # Reactivate for other tests
+            Activate-PSVirtualEnv -Name $script:TestEnvironmentName
+        }
+        
+        It 'Should support version specification' {
+            { Install-PSModuleInEnv -Name 'VersionedModule' -RequiredVersion '2.0.0' } | Should -Not -Throw
+        }
+    }
+}
+
+Describe 'Remove-PSVirtualEnv' {
+    Context 'Removing environments' {
+        BeforeEach {
+            New-PSVirtualEnv -Name $script:TestEnvironmentName -Force
+        }
+        
+        It 'Should remove an existing environment' {
+            { Remove-PSVirtualEnv -Name $script:TestEnvironmentName -Force } | Should -Not -Throw
+            
+            # Verify environment is gone
+            $envPath = Join-Path $script:TestEnvironmentPath $script:TestEnvironmentName
+            Test-Path $envPath | Should -BeFalse
+            
+            Get-PSVirtualEnv -Name $script:TestEnvironmentName | Should -BeNullOrEmpty
+        }
+        
+        It 'Should fail when environment does not exist' {
+            Remove-PSVirtualEnv -Name $script:TestEnvironmentName -Force
+            { Remove-PSVirtualEnv -Name $script:TestEnvironmentName -ErrorAction Stop } | Should -Throw
+        }
+        
+        It 'Should not remove active environment' {
+            Activate-PSVirtualEnv -Name $script:TestEnvironmentName
+            
+            try {
+                { Remove-PSVirtualEnv -Name $script:TestEnvironmentName -ErrorAction Stop } | Should -Throw
+            } finally {
+                Deactivate-PSVirtualEnv
+            }
+        }
+    }
+}
