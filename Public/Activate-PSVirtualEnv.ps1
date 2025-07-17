@@ -75,6 +75,7 @@ function Activate-PSVirtualEnv {
                 Name = $environment.Name
                 Path = $environment.Path
                 OriginalPath = $script:OriginalPSModulePath
+                ProtectedPath = $environment.Path
             }
             
             # Log activation

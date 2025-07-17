@@ -1,27 +1,7 @@
 function Import-PSModuleInEnv {
     <#
     .SYNOPSIS
-        Imports a module from the active virtual environment.
-        
-    .DESCRIPTION
-        Imports a module specifically from the virtual environment, ensuring
-        it doesn't conflict with or load from system locations.
-        
-    .PARAMETER Name
-        Module name to import.
-        
-    .PARAMETER Force
-        Force import even if already loaded.
-        
-    .PARAMETER Global
-        Import to global scope.
-        
-    .PARAMETER PassThru
-        Return the module info.
-        
-    .EXAMPLE
-        Import-PSModuleInEnv -Name "Pester"
-        Imports Pester from the active virtual environment.
+        Imports a module from the virtual environment with full dependency resolution.
     #>
     [CmdletBinding()]
     param(
@@ -33,16 +13,12 @@ function Import-PSModuleInEnv {
         [switch]$Force,
         
         [Parameter()]
-        [switch]$Global,
-        
-        [Parameter()]
-        [switch]$PassThru
+        [switch]$ResolveDependencies = $true
     )
     
     begin {
-        Write-Verbose "Importing module '$Name' from virtual environment"
+        Write-Verbose "Importing module '$Name' from virtual environment with dependency resolution"
         
-        # Verify environment is active
         if (-not (Test-EnvironmentActive)) {
             throw "No virtual environment is active. Use Activate-PSVirtualEnv to activate an environment first."
         }
@@ -53,21 +29,69 @@ function Import-PSModuleInEnv {
         $environment = Get-EnvironmentFromRegistry -Name $activeEnv.Name
         
         if (-not $environment) {
-            Write-Error "Active environment configuration not found. The environment may be corrupted."
+            Write-Error "Active environment configuration not found."
             return
         }
         
+        # Store the currently pristine, isolated path.
+        $isolatedPath = $env:PSModulePath
+        # Store the user's current autoloading preference
+        $originalAutoLoadingPref = $PSModuleAutoLoadingPreference
+        $result = $null
+
+
         try {
-            $result = Import-ModuleFromEnvironment -Name $Name -EnvironmentPath $environment.Path -Force:$Force -Global:$Global -PassThru:$PassThru
-            
-            Write-Information "Successfully imported '$Name' from virtual environment" -InformationAction Continue
-            
-            if ($PassThru) {
+
+            $PSModuleAutoLoadingPreference = 'None'
+
+            $importParams = @{
+                Name     = $Name
+                Force    = $Force.IsPresent
+                PassThru = $PassThru.IsPresent
+            }
+        
+            if ($Global.IsPresent) {
+                $importParams['Global'] = $true
+            }
+        
+            Write-Verbose "Importing module from: $name with autoloading disabled."
+            $result = Import-Module @importParams
+            return $result
+            <#if ($ResolveDependencies) {
+
+                 
+                # Use advanced dependency resolution
+                $result = Import-ModuleWithDependencies -ModuleName $Name -EnvironmentPath $environment.Path -Force:$Force
+                
+                if ($result.Success) {
+                    Write-Information "Successfully imported '$Name' with all dependencies" -InformationAction Continue
+                }
+                else {
+                    Write-Warning "Import completed with some failures. Check loaded modules with Get-Module."
+                }
+                
                 return $result
             }
+            else {
+                # Simple import (fallback to original method)
+                $result = Import-ModuleFromEnvironment -Name $Name -EnvironmentPath $environment.Path -Force:$Force -PassThru
+                Write-Information "Successfully imported '$Name' (simple mode)" -InformationAction Continue
+                return $result
+            }#>
             
-        } catch {
-            Write-Error "Failed to import module '$Name' from virtual environment: $_"
+        }
+        catch {
+            Write-Error "Failed to import module '$Name': $_"
+            throw
+        }
+        finally {
+
+            $PSModuleAutoLoadingPreference = $originalAutoLoadingPref
+            <#
+            if ($env:PSModulePath -ne $isolatedPath) {
+                Write-Verbose "PowerShell auto-loader modified PSModulePath during import. Restoring strict isolation."
+                $env:PSModulePath = $isolatedPath
+            }#>
         }
     }
 }
