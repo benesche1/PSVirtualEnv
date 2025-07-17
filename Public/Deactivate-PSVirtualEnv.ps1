@@ -29,6 +29,24 @@ function Deactivate-PSVirtualEnv {
         $activeEnv = Get-ActiveEnvironment
         
         try {
+
+            # ENHANCEMENT: Disable path protection first
+            Write-Verbose "Disabling PSModulePath protection"
+            Disable-PSModulePathProtection
+            
+            # ENHANCEMENT: Disable module import hooks
+            Write-Verbose "Disabling module import hooks"
+            Disable-ModuleImportHooks
+            
+            # ENHANCEMENT: Unregister event handlers
+            Write-Verbose "Unregistering PowerShell idle event handlers"
+            Get-EventSubscriber | Where-Object { 
+                $_.SourceIdentifier -eq 'PowerShell.OnIdle' 
+            } | Unregister-Event -Force
+            
+            # Restore original PSModulePath
+            Restore-OriginalPSModulePath
+            Write-Verbose "Restored original PSModulePath"
             # Restore original PSModulePath
             Restore-OriginalPSModulePath
             Write-Verbose "Restored original PSModulePath"
@@ -38,7 +56,8 @@ function Deactivate-PSVirtualEnv {
                 Set-Item -Path function:prompt -Value $script:OriginalPromptFunction
                 $script:OriginalPromptFunction = $null
                 Write-Verbose "Restored original prompt function"
-            } else {
+            }
+            else {
                 # Set default prompt if no original was stored
                 Set-Item -Path function:prompt -Value {
                     "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "
@@ -59,8 +78,22 @@ function Deactivate-PSVirtualEnv {
             
             Write-Information "Successfully deactivated virtual environment '$envName'" -InformationAction Continue
             
-        } catch {
+        }
+        catch {
             Write-Error "Failed to deactivate virtual environment: $_"
+            
+            # Attempt emergency cleanup
+            try {
+                Write-Warning "Attempting emergency cleanup of virtual environment state"
+                Disable-PSModulePathProtection
+                Disable-ModuleImportHooks
+                Get-EventSubscriber | Unregister-Event -Force -ErrorAction SilentlyContinue
+                $script:ActiveEnvironment = $null
+            }
+            catch {
+                Write-Error "Emergency cleanup failed: $_"
+            }
+        
         }
     }
 }

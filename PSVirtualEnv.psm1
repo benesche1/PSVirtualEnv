@@ -37,5 +37,34 @@ if (-not (Test-Path $script:RegistryPath)) {
     @() | ConvertTo-Json | Set-Content -Path $script:RegistryPath -Encoding UTF8
 }
 
+# ENHANCEMENT: Register module removal event to clean up protection systems
+$MyInvocation.MyCommand.ScriptBlock.Module.OnRemove = {
+    Write-Verbose "PSVirtualEnv module being removed, cleaning up protection systems"
+    
+    try {
+        # Disable all protection systems
+        if (Get-Command Disable-PSModulePathProtection -ErrorAction SilentlyContinue) {
+            Disable-PSModulePathProtection
+        }
+        
+        if (Get-Command Disable-ModuleImportHooks -ErrorAction SilentlyContinue) {
+            Disable-ModuleImportHooks
+        }
+        
+        # Clean up any remaining event subscribers
+        Get-EventSubscriber | Where-Object { 
+            $_.SourceIdentifier -eq 'PowerShell.OnIdle' 
+        } | Unregister-Event -Force -ErrorAction SilentlyContinue
+        
+        # If an environment was active, attempt to restore original state
+        if ($script:ActiveEnvironment -and $script:OriginalPSModulePath) {
+            $env:PSModulePath = $script:OriginalPSModulePath
+            Write-Verbose "Restored original PSModulePath during module cleanup"
+        }
+    } catch {
+        Write-Warning "Error during PSVirtualEnv module cleanup: $_"
+    }
+}
+
 # Export module members - use the actual function names
 Export-ModuleMember -Function $publicFunctions

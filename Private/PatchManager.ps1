@@ -136,3 +136,67 @@ function Restore-OriginalPSModulePath {
         Write-Warning "No original PSModulePath backup found to restore."
     }
 }
+
+function Set-PSModulePathForEnvironment {
+    <#
+    .SYNOPSIS
+        Sets the PSModulePath for the active environment with smart system module inclusion.
+    
+    .DESCRIPTION
+        Modifies the PSModulePath to prioritize the virtual environment's module directory,
+        while ensuring essential system modules remain accessible.
+    
+    .PARAMETER EnvironmentPath
+        The path to the virtual environment.
+    
+    .PARAMETER IncludeSystemModules
+        Whether to include system module paths.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$EnvironmentPath,
+        
+        [switch]$IncludeSystemModules
+    )
+    
+    $envModulePath = Join-Path $EnvironmentPath 'Modules'
+    
+    # Always include essential system paths for critical modules like PowerShellGet
+    $essentialSystemPaths = @()
+    
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        if ($IsWindows) {
+            $essentialSystemPaths = @(
+                (Join-Path $env:ProgramFiles 'PowerShell\Modules'),
+                (Join-Path $env:ProgramFiles 'PowerShell\7\Modules')
+            )
+        } else {
+            $essentialSystemPaths = @(
+                '/usr/local/share/powershell/Modules',
+                '/opt/microsoft/powershell/7/Modules'
+            )
+        }
+    } else {
+        # Windows PowerShell
+        $essentialSystemPaths = @(
+            (Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'),
+            (Join-Path $env:windir 'system32\WindowsPowerShell\v1.0\Modules')
+        )
+    }
+    
+    # Filter to only existing paths
+    $essentialSystemPaths = $essentialSystemPaths | Where-Object { Test-Path $_ }
+    
+    if ($IncludeSystemModules.IsPresent) {
+        # Include all system paths
+        $systemPaths = Get-SystemModulePaths
+        $newPath = @($envModulePath) + $systemPaths
+    } else {
+        # Include only essential system paths (for PowerShellGet, etc.)
+        $newPath = @($envModulePath) + $essentialSystemPaths
+    }
+    
+    $env:PSModulePath = $newPath -join [IO.Path]::PathSeparator
+    Write-Verbose "Set PSModulePath with environment priority: $($env:PSModulePath)"
+}

@@ -1,0 +1,559 @@
+# ========================================
+# UPDATED FILE: Private/PathProtection.ps1
+# ========================================
+
+# Global variables to track path protection
+$script:PathProtectionActive = $false
+$script:ProtectedPSModulePath = $null
+$script:PathCheckTimer = $null
+$script:TemporaryPathBypass = $false
+$script:BypassStartTime = $null
+$script:SystemModulePaths = $null
+
+function Initialize-SystemModulePaths {
+    <#
+    .SYNOPSIS
+        Initializes and caches system module paths for smart protection.
+    #>
+    [CmdletBinding()]
+    param()
+    
+    if ($script:SystemModulePaths) {
+        return $script:SystemModulePaths
+    }
+    
+    # Get essential system paths that should always be available
+    $systemPaths = @()
+    
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        if ($IsWindows) {
+            $systemPaths += @(
+                (Join-Path $env:ProgramFiles 'PowerShell\Modules'),
+                (Join-Path $env:ProgramFiles 'PowerShell\7\Modules'),
+                (Join-Path $env:windir 'system32\WindowsPowerShell\v1.0\Modules')
+            )
+        } else {
+            $systemPaths += @(
+                '/usr/local/share/powershell/Modules',
+                '/opt/microsoft/powershell/7/Modules'
+            )
+        }
+    } else {
+        # Windows PowerShell
+        $systemPaths += @(
+            (Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'),
+            (Join-Path $env:windir 'system32\WindowsPowerShell\v1.0\Modules')
+        )
+        
+        if (Test-Path ${env:ProgramFiles(x86)}) {
+            $systemPaths += (Join-Path ${env:ProgramFiles(x86)} 'WindowsPowerShell\Modules')
+        }
+    }
+    
+    # Filter to only existing paths
+    $script:SystemModulePaths = $systemPaths | Where-Object { Test-Path $_ }
+    return $script:SystemModulePaths
+}
+
+function Enable-PSModulePathProtection {
+    <#
+    .SYNOPSIS
+        Enables smart protection of PSModulePath in virtual environment.
+    
+    .DESCRIPTION
+        Creates a timer-based monitoring system with smart bypass capabilities
+        for legitimate module operations.
+    
+    .PARAMETER ProtectedPath
+        The PSModulePath that should be maintained and protected.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ProtectedPath
+    )
+    
+    if ($script:PathProtectionActive) {
+        Write-Verbose "PSModulePath protection already active"
+        return
+    }
+    
+    # Initialize system paths
+    Initialize-SystemModulePaths | Out-Null
+    
+    $script:ProtectedPSModulePath = $ProtectedPath
+    $script:PathProtectionActive = $true
+    $script:TemporaryPathBypass = $false
+    
+    # Create a timer that checks PSModulePath every 200ms (reduced frequency)
+    $script:PathCheckTimer = New-Object System.Timers.Timer
+    $script:PathCheckTimer.Interval = 200
+    $script:PathCheckTimer.AutoReset = $true
+    
+    # Register the smart event handler
+    $eventAction = {
+        # Skip protection if we're in a temporary bypass
+        if ($script:TemporaryPathBypass) {
+            # Check if bypass has expired (after 5 seconds)
+            if ($script:BypassStartTime -and ((Get-Date) - $script:BypassStartTime).TotalSeconds -gt 5) {
+                $script:TemporaryPathBypass = $false
+                $script:BypassStartTime = $null
+                Write-Verbose "Temporary path bypass expired, resuming protection"
+            } else {
+                return # Still in bypass period
+            }
+        }
+        
+        if ($script:PathProtectionActive -and $env:PSModulePath -ne $script:ProtectedPSModulePath) {
+            # Check if the current path includes critical system modules
+            $currentPath = $env:PSModulePath
+            $hasEssentialPaths = $false
+            
+            # Check if PowerShellGet path is included (essential for module operations)
+            $systemPaths = Initialize-SystemModulePaths
+            foreach ($sysPath in $systemPaths) {
+                if ($currentPath -like "*$sysPath*") {
+                    $hasEssentialPaths = $true
+                    break
+                }
+            }
+            
+            # Only restore if the change doesn't include essential system paths
+            # This allows legitimate module operations to proceed
+            if (-not $hasEssentialPaths) {
+                Write-Verbose "PSModulePath was modified inappropriately, restoring protected path"
+                $env:PSModulePath = $script:ProtectedPSModulePath
+            } else {
+                Write-Verbose "PSModulePath includes essential system paths, allowing temporary access"
+                # Set a temporary bypass to prevent immediate restoration
+                $script:TemporaryPathBypass = $true
+                $script:BypassStartTime = Get-Date
+            }
+        }
+    }
+    
+    Register-ObjectEvent -InputObject $script:PathCheckTimer -EventName Elapsed -Action $eventAction | Out-Null
+    $script:PathCheckTimer.Start()
+    
+    Write-Verbose "Smart PSModulePath protection enabled with path: $ProtectedPath"
+}
+
+function Request-TemporaryPathBypass {
+    <#
+    .SYNOPSIS
+        Requests a temporary bypass of path protection for module operations.
+    
+    .DESCRIPTION
+        Temporarily disables path protection to allow legitimate module operations
+        like Install-Module or Import-Module to access system modules.
+    
+    .PARAMETER DurationSeconds
+        How long the bypass should last (default: 10 seconds).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter()]
+        [int]$DurationSeconds = 10
+    )
+    
+    if (-not $script:PathProtectionActive) {
+        return
+    }
+    
+    Write-Verbose "Requesting temporary path bypass for $DurationSeconds seconds"
+    $script:TemporaryPathBypass = $true
+    $script:BypassStartTime = Get-Date
+    
+    # Schedule automatic re-enable
+    $timer = New-Object System.Timers.Timer
+    $timer.Interval = $DurationSeconds * 1000
+    $timer.AutoReset = $false
+    
+    Register-ObjectEvent -InputObject $timer -EventName Elapsed -Action {
+        $script:TemporaryPathBypass = $false
+        $script:BypassStartTime = $null
+        Write-Verbose "Temporary path bypass expired automatically"
+        $sender.Dispose()
+    } | Out-Null
+    
+    $timer.Start()
+}
+
+function Disable-PSModulePathProtection {
+    <#
+    .SYNOPSIS
+        Disables PSModulePath protection.
+    #>
+    [CmdletBinding()]
+    param()
+    
+    if (-not $script:PathProtectionActive) {
+        Write-Verbose "PSModulePath protection already inactive"
+        return
+    }
+    
+    $script:PathProtectionActive = $false
+    $script:TemporaryPathBypass = $false
+    $script:BypassStartTime = $null
+    
+    if ($script:PathCheckTimer) {
+        $script:PathCheckTimer.Stop()
+        
+        # Remove all event handlers for this timer
+        Get-EventSubscriber | Where-Object { 
+            $_.SourceObject -eq $script:PathCheckTimer 
+        } | Unregister-Event -Force
+        
+        $script:PathCheckTimer.Dispose()
+        $script:PathCheckTimer = $null
+    }
+    
+    # Clean up any temporary bypass timers
+    Get-EventSubscriber | Where-Object { 
+        $_.Action -like "*TemporaryPathBypass*" 
+    } | Unregister-Event -Force
+    
+    $script:ProtectedPSModulePath = $null
+    Write-Verbose "PSModulePath protection disabled"
+}
+
+function Test-PSModulePathProtection {
+    <#
+    .SYNOPSIS
+        Tests if PSModulePath protection is currently active.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+    
+    return $script:PathProtectionActive
+}
+
+function Get-ProtectedPSModulePath {
+    <#
+    .SYNOPSIS
+        Gets the currently protected PSModulePath.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+    
+    return $script:ProtectedPSModulePath
+}
+
+# ========================================
+# UPDATED FILE: Private/ModuleHooks.ps1
+# ========================================
+
+$script:OriginalImportModule = $null
+$script:OriginalInstallModule = $null
+$script:OriginalSaveModule = $null
+$script:HooksActive = $false
+
+function Enable-ModuleImportHooks {
+    <#
+    .SYNOPSIS
+        Enables smart module hooks that temporarily allow system access.
+    #>
+    [CmdletBinding()]
+    param()
+    
+    if ($script:HooksActive) {
+        Write-Verbose "Module import hooks already active"
+        return
+    }
+    
+    # Store original commands
+    $script:OriginalImportModule = Get-Command Import-Module -CommandType Cmdlet
+    $script:OriginalInstallModule = Get-Command Install-Module -CommandType Function -ErrorAction SilentlyContinue
+    $script:OriginalSaveModule = Get-Command Save-Module -CommandType Function -ErrorAction SilentlyContinue
+    
+    # Create smart Import-Module wrapper
+    $importWrapper = {
+        param(
+            [Parameter(ValueFromPipeline = $true, ValueFromPipelineByPropertyName = $true, Position = 0)]
+            [string[]]$Name,
+            
+            [switch]$Force, [switch]$Global, [switch]$PassThru, [switch]$AsCustomObject,
+            [switch]$NoClobber, [switch]$DisableNameChecking, [switch]$SkipEditionCheck,
+            [version]$MinimumVersion, [string]$MaximumVersion, [version]$RequiredVersion,
+            [object[]]$ArgumentList, [string]$Scope, [string]$Prefix,
+            [string[]]$Function, [string[]]$Cmdlet, [string[]]$Variable, [string[]]$Alias
+        )
+        
+        # Request temporary bypass for Import-Module operations
+        if (Test-PSModulePathProtection) {
+            Request-TemporaryPathBypass -DurationSeconds 15
+        }
+        
+        try {
+            # Build parameters
+            $importParams = @{}
+            foreach ($param in $PSBoundParameters.GetEnumerator()) {
+                $importParams[$param.Key] = $param.Value
+            }
+            
+            # Call original Import-Module
+            return & $script:OriginalImportModule @importParams
+            
+        } catch {
+            throw
+        }
+    }
+    
+    # Create smart Install-Module wrapper
+    $installWrapper = {
+        param(
+            [Parameter(Mandatory, Position = 0)]
+            [string[]]$Name,
+            
+            [string]$MinimumVersion, [string]$MaximumVersion, [string]$RequiredVersion,
+            [string]$Repository, [PSCredential]$Credential, [string]$Scope,
+            [string]$Proxy, [PSCredential]$ProxyCredential, [switch]$AllowClobber,
+            [switch]$SkipPublisherCheck, [switch]$Force, [switch]$AllowPrerelease,
+            [switch]$AcceptLicense, [switch]$PassThru
+        )
+        
+        # Request longer bypass for Install-Module operations
+        if (Test-PSModulePathProtection) {
+            Request-TemporaryPathBypass -DurationSeconds 30
+        }
+        
+        try {
+            # Build parameters
+            $installParams = @{}
+            foreach ($param in $PSBoundParameters.GetEnumerator()) {
+                $installParams[$param.Key] = $param.Value
+            }
+            
+            # Call original Install-Module
+            if ($script:OriginalInstallModule) {
+                return & $script:OriginalInstallModule @installParams
+            } else {
+                # Fallback to direct call
+                return Install-Module @installParams
+            }
+            
+        } catch {
+            throw
+        }
+    }
+    
+    # Replace functions
+    Set-Item -Path function:global:Import-Module -Value $importWrapper -Force
+    Set-Item -Path function:global:Install-Module -Value $installWrapper -Force
+    
+    $script:HooksActive = $true
+    Write-Verbose "Smart module hooks enabled"
+}
+
+function Disable-ModuleImportHooks {
+    <#
+    .SYNOPSIS
+        Disables module import hooks.
+    #>
+    [CmdletBinding()]
+    param()
+    
+    if (-not $script:HooksActive) {
+        Write-Verbose "Module import hooks already inactive"
+        return
+    }
+    
+    # Remove our custom functions to let originals take precedence
+    Remove-Item -Path function:global:Import-Module -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path function:global:Install-Module -Force -ErrorAction SilentlyContinue
+    
+    $script:OriginalImportModule = $null
+    $script:OriginalInstallModule = $null
+    $script:OriginalSaveModule = $null
+    $script:HooksActive = $false
+    
+    Write-Verbose "Module import hooks disabled"
+}
+
+# ========================================
+# UPDATED FILE: Private/PatchManager.ps1 (Enhanced)
+# ========================================
+
+function Set-PSModulePathForEnvironment {
+    <#
+    .SYNOPSIS
+        Sets the PSModulePath for the active environment with smart system module inclusion.
+    
+    .DESCRIPTION
+        Modifies the PSModulePath to prioritize the virtual environment's module directory,
+        while ensuring essential system modules remain accessible.
+    
+    .PARAMETER EnvironmentPath
+        The path to the virtual environment.
+    
+    .PARAMETER IncludeSystemModules
+        Whether to include system module paths.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$EnvironmentPath,
+        
+        [switch]$IncludeSystemModules
+    )
+    
+    $envModulePath = Join-Path $EnvironmentPath 'Modules'
+    
+    # Always include essential system paths for critical modules like PowerShellGet
+    $essentialSystemPaths = @()
+    
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        if ($IsWindows) {
+            $essentialSystemPaths = @(
+                (Join-Path $env:ProgramFiles 'PowerShell\Modules'),
+                (Join-Path $env:ProgramFiles 'PowerShell\7\Modules')
+            )
+        } else {
+            $essentialSystemPaths = @(
+                '/usr/local/share/powershell/Modules',
+                '/opt/microsoft/powershell/7/Modules'
+            )
+        }
+    } else {
+        # Windows PowerShell
+        $essentialSystemPaths = @(
+            (Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'),
+            (Join-Path $env:windir 'system32\WindowsPowerShell\v1.0\Modules')
+        )
+    }
+    
+    # Filter to only existing paths
+    $essentialSystemPaths = $essentialSystemPaths | Where-Object { Test-Path $_ }
+    
+    if ($IncludeSystemModules.IsPresent) {
+        # Include all system paths
+        $systemPaths = Get-SystemModulePaths
+        $newPath = @($envModulePath) + $systemPaths
+    } else {
+        # Include only essential system paths (for PowerShellGet, etc.)
+        $newPath = @($envModulePath) + $essentialSystemPaths
+    }
+    
+    $env:PSModulePath = $newPath -join [IO.Path]::PathSeparator
+    Write-Verbose "Set PSModulePath with environment priority: $($env:PSModulePath)"
+}
+
+# ========================================
+# UPDATED FILE: Public/Install-PSModuleInEnv.ps1 (Key changes)
+# ========================================
+
+function Install-PSModuleInEnv {
+    # ... existing parameters ...
+    
+    begin {
+        Write-Verbose "Installing module '$Name' into virtual environment"
+        
+        # Verify environment is active
+        if (-not (Test-EnvironmentActive)) {
+            throw "No virtual environment is active. Use Activate-PSVirtualEnv to activate an environment first."
+        }
+    }
+    
+    process {
+        $activeEnv = Get-ActiveEnvironment
+        $environment = Get-EnvironmentFromRegistry -Name $activeEnv.Name
+        
+        if (-not $environment) {
+            Write-Error "Active environment configuration not found. The environment may be corrupted."
+            return
+        }
+        
+        $modulePath = Join-Path $environment.Path 'Modules'
+        
+        # ENHANCEMENT: Request temporary bypass before module operations
+        if (Test-PSModulePathProtection) {
+            Write-Verbose "Requesting temporary path bypass for module installation"
+            Request-TemporaryPathBypass -DurationSeconds 60  # Longer bypass for installations
+        }
+        
+        # Build Install-Module parameters
+        $installParams = @{
+            Name = $Name
+            Repository = $Repository
+            Scope = 'CurrentUser'
+            Force = $Force.IsPresent
+            AllowPrerelease = $AllowPrerelease.IsPresent
+            ErrorAction = 'Stop'
+        }
+        
+        if ($RequiredVersion) {
+            $installParams['RequiredVersion'] = $RequiredVersion
+        }
+        
+        if ($PSCmdlet.ShouldProcess("$Name in environment '$($environment.Name)'", "Install module")) {
+            try {
+                Write-Information "Installing module '$Name' from repository '$Repository'..." -InformationAction Continue
+                
+                # Find the module first
+                $findParams = @{
+                    Name = $Name
+                    Repository = $Repository
+                    ErrorAction = 'Stop'
+                }
+                
+                if ($RequiredVersion) {
+                    $findParams['RequiredVersion'] = $RequiredVersion
+                }
+                
+                if ($AllowPrerelease) {
+                    $findParams['AllowPrerelease'] = $true
+                }
+                
+                $moduleToInstall = Find-Module @findParams | Select-Object -First 1
+                
+                if (-not $moduleToInstall) {
+                    throw "Module '$Name' not found in repository '$Repository'"
+                }
+                
+                # Save the module to the environment path
+                $saveParams = @{
+                    Name = $moduleToInstall.Name
+                    Path = $modulePath
+                    Repository = $Repository
+                    Force = $Force.IsPresent
+                    ErrorAction = 'Stop'
+                }
+                
+                if ($RequiredVersion) {
+                    $saveParams['RequiredVersion'] = $RequiredVersion
+                } else {
+                    $saveParams['RequiredVersion'] = $moduleToInstall.Version.ToString()
+                }
+                
+                if ($AllowPrerelease) {
+                    $saveParams['AllowPrerelease'] = $true
+                }
+                
+                Save-Module @saveParams
+                
+                # Update environment configuration
+                $environment.AddModule($moduleToInstall.Name, $moduleToInstall.Version.ToString())
+                Set-EnvironmentConfig -Environment $environment
+                
+                # Update registry
+                Add-EnvironmentToRegistry -Environment $environment
+                
+                # Log installation
+                $logPath = Join-Path $environment.Path "Logs\modules.log"
+                $logDir = Split-Path $logPath -Parent
+                if (-not (Test-Path $logDir)) {
+                    New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+                }
+                $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Installed: $($moduleToInstall.Name) v$($moduleToInstall.Version)"
+                Add-Content -Path $logPath -Value $logEntry -ErrorAction SilentlyContinue
+                
+                Write-Information "Successfully installed module '$($moduleToInstall.Name)' version $($moduleToInstall.Version)" -InformationAction Continue
+                
+            } catch {
+                Write-Error "Failed to install module '$Name': $_"
+            }
+        }
+    }
+}

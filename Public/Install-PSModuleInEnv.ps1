@@ -78,14 +78,20 @@ function Install-PSModuleInEnv {
         
         $modulePath = Join-Path $environment.Path 'Modules'
         
+        # ENHANCEMENT: Request temporary bypass before module operations
+        if (Test-PSModulePathProtection) {
+            Write-Verbose "Requesting temporary path bypass for module installation"
+            Request-TemporaryPathBypass -DurationSeconds 60  # Longer bypass for installations
+        }
+
         # Build Install-Module parameters
         $installParams = @{
-            Name = $Name
-            Repository = $Repository
-            Scope = 'CurrentUser'
-            Force = $Force.IsPresent
+            Name            = $Name
+            Repository      = $Repository
+            Scope           = 'CurrentUser'
+            Force           = $Force.IsPresent
             AllowPrerelease = $AllowPrerelease.IsPresent
-            ErrorAction = 'Stop'
+            ErrorAction     = 'Stop'
         }
         
         if ($RequiredVersion) {
@@ -96,73 +102,76 @@ function Install-PSModuleInEnv {
         $installParams['Path'] = $modulePath
         
         if ($PSCmdlet.ShouldProcess("$Name in environment '$($environment.Name)'", "Install module")) {
+            # try {
+            Write-Information "Installing module '$Name' from repository '$Repository'..." -InformationAction Continue
+                
+            # Temporarily modify PSModulePath to ensure proper installation
+            #    $originalPath = $env:PSModulePath
+            #   $env:PSModulePath = "$modulePath;$originalPath"
+                
             try {
-                Write-Information "Installing module '$Name' from repository '$Repository'..." -InformationAction Continue
-                
-                # Temporarily modify PSModulePath to ensure proper installation
-                $originalPath = $env:PSModulePath
-                $env:PSModulePath = "$modulePath;$originalPath"
-                
-                try {
-                    # Find the module first to get version info
-                    $findParams = @{
-                        Name = $Name
-                        Repository = $Repository
-                        ErrorAction = 'Stop'
-                    }
-                    
-                    if ($RequiredVersion) {
-                        $findParams['RequiredVersion'] = $RequiredVersion
-                    }
-                    
-                    if ($AllowPrerelease) {
-                        $findParams['AllowPrerelease'] = $true
-                    }
-                    
-                    $moduleToInstall = Find-Module @findParams | Select-Object -First 1
-                    
-                    if (-not $moduleToInstall) {
-                        throw "Module '$Name' not found in repository '$Repository'"
-                    }
-                    
-                    # Save the module to the environment path
-                    $saveParams = @{
-                        Name = $moduleToInstall.Name
-                        Path = $modulePath
-                        Repository = $Repository
-                        Force = $Force.IsPresent
-                        ErrorAction = 'Stop'
-                    }
-                    
-                    if ($RequiredVersion) {
-                        $saveParams['RequiredVersion'] = $RequiredVersion
-                    } else {
-                        $saveParams['RequiredVersion'] = $moduleToInstall.Version.ToString()
-                    }
-                    
-                    if ($AllowPrerelease) {
-                        $saveParams['AllowPrerelease'] = $true
-                    }
-                    
-                    Save-Module @saveParams
-                    
-                    # Update environment configuration
-                    $environment.AddModule($moduleToInstall.Name, $moduleToInstall.Version.ToString())
-                    Set-EnvironmentConfig -Environment $environment
-                    
-                    # Log installation
-                    $logPath = Join-Path $environment.Path "Logs\modules.log"
-                    $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Installed: $($moduleToInstall.Name) v$($moduleToInstall.Version)"
-                    Add-Content -Path $logPath -Value $logEntry -ErrorAction SilentlyContinue
-                    
-                    Write-Information "Successfully installed module '$($moduleToInstall.Name)' version $($moduleToInstall.Version)" -InformationAction Continue
-                    
-                } finally {
-                    # Restore original PSModulePath
-                    $env:PSModulePath = $originalPath
+                # Find the module first to get version info
+                $findParams = @{
+                    Name        = $Name
+                    Repository  = $Repository
+                    ErrorAction = 'Stop'
                 }
+                    
+                if ($RequiredVersion) {
+                    $findParams['RequiredVersion'] = $RequiredVersion
+                }
+                    
+                if ($AllowPrerelease) {
+                    $findParams['AllowPrerelease'] = $true
+                }
+                    
+                $moduleToInstall = Find-Module @findParams | Select-Object -First 1
+                    
+                if (-not $moduleToInstall) {
+                    throw "Module '$Name' not found in repository '$Repository'"
+                }
+                    
+                # Save the module to the environment path
+                $saveParams = @{
+                    Name        = $moduleToInstall.Name
+                    Path        = $modulePath
+                    Repository  = $Repository
+                    Force       = $Force.IsPresent
+                    ErrorAction = 'Stop'
+                }
+                    
+                if ($RequiredVersion) {
+                    $saveParams['RequiredVersion'] = $RequiredVersion
+                }
+                else {
+                    $saveParams['RequiredVersion'] = $moduleToInstall.Version.ToString()
+                }
+                    
+                if ($AllowPrerelease) {
+                    $saveParams['AllowPrerelease'] = $true
+                }
+                    
+                Save-Module @saveParams
+                    
+                # Update environment configuration
+                $environment.AddModule($moduleToInstall.Name, $moduleToInstall.Version.ToString())
+                Set-EnvironmentConfig -Environment $environment
+                    
+                # Log installation
+                $logPath = Join-Path $environment.Path "Logs\modules.log"
+                $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Installed: $($moduleToInstall.Name) v$($moduleToInstall.Version)"
+                Add-Content -Path $logPath -Value $logEntry -ErrorAction SilentlyContinue
+                    
+                Write-Information "Successfully installed module '$($moduleToInstall.Name)' version $($moduleToInstall.Version)" -InformationAction Continue
+                    
+                #}
+                #finally {
+                # Restore original PSModulePath
+                #    $env:PSModulePath = $originalPath
+                #}
                 
-            } catch {
+            }
+            catch {
                 Write-Error "Failed to install module '$Name': $_"
             }
         }

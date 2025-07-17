@@ -79,7 +79,8 @@ function Activate-PSVirtualEnv {
                 }
                 if ($script:OriginalPromptFunction) {
                     & $script:OriginalPromptFunction
-                } else {
+                }
+                else {
                     "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "
                 }
             }
@@ -89,9 +90,33 @@ function Activate-PSVirtualEnv {
             
             # Set active environment
             $script:ActiveEnvironment = @{
-                Name = $environment.Name
-                Path = $environment.Path
+                Name         = $environment.Name
+                Path         = $environment.Path
                 OriginalPath = $script:OriginalPSModulePath
+            }
+
+            # ENHANCEMENT: Enable PSModulePath protection
+            Enable-PSModulePathProtection -ProtectedPath $script:ActiveEnvironment.path
+            
+            # ENHANCEMENT: Enable module import hooks
+            Enable-ModuleImportHooks
+            
+            # ENHANCEMENT: Register PowerShell idle event handler as backup
+            $idleAction = {
+                if ($script:ActiveEnvironment -and $env:PSModulePath -ne $script:ActiveEnvironment.path) {
+                    Write-Verbose "PowerShell idle event detected path change, restoring"
+                    $env:PSModulePath = $script:ActiveEnvironment.path
+                }
+            }
+            
+            Register-EngineEvent -SourceIdentifier PowerShell.OnIdle -Action $idleAction | Out-Null
+            
+            # ENHANCEMENT: Pre-load critical modules that might trigger auto-loading
+            $criticalModules = @('Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Security')
+            foreach ($module in $criticalModules) {
+                if (Get-Module -Name $module -ListAvailable -ErrorAction SilentlyContinue) {
+                    Import-Module $module -Force -Global -ErrorAction SilentlyContinue
+                }
             }
             
             # Log activation
@@ -102,15 +127,24 @@ function Activate-PSVirtualEnv {
             Write-Information "Successfully activated virtual environment '$Name'" -InformationAction Continue
             Write-Information "Module installations will now be isolated to this environment" -InformationAction Continue
             
-        } catch {
+        }
+        catch {
             Write-Error "Failed to activate virtual environment: $_"
             
             # Rollback changes
-            if ($script:OriginalPSModulePath) {
-                $env:PSModulePath = $script:OriginalPSModulePath
-                $script:OriginalPSModulePath = $null
+            try {
+                Disable-PSModulePathProtection
+                Disable-ModuleImportHooks
+                Get-EventSubscriber | Where-Object { $_.SourceIdentifier -eq 'PowerShell.OnIdle' } | Unregister-Event -Force
+                
+                if ($script:OriginalPSModulePath) {
+                    $env:PSModulePath = $script:OriginalPSModulePath
+                    $script:OriginalPSModulePath = $null
+                }
+                $script:ActiveEnvironment = $null
+            } catch {
+                Write-Warning "Failed to properly rollback activation changes: $_"
             }
-            $script:ActiveEnvironment = $null
         }
     }
 }

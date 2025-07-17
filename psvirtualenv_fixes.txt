@@ -1,0 +1,683 @@
+# ========================================
+# FILE: Private/PathProtection.ps1
+# ========================================
+
+# Global variables to track path protection
+$script:PathProtectionActive = $false
+$script:ProtectedPSModulePath = $null
+$script:PathCheckTimer = $null
+
+function Enable-PSModulePathProtection {
+    <#
+    .SYNOPSIS
+        Enables continuous protection of PSModulePath in virtual environment.
+    
+    .DESCRIPTION
+        Creates a timer-based monitoring system that continuously checks and restores
+        the PSModulePath if it gets modified by PowerShell's auto-loading mechanism.
+    
+    .PARAMETER ProtectedPath
+        The PSModulePath that should be maintained and protected.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ProtectedPath
+    )
+    
+    if ($script:PathProtectionActive) {
+        Write-Verbose "PSModulePath protection already active"
+        return
+    }
+    
+    $script:ProtectedPSModulePath = $ProtectedPath
+    $script:PathProtectionActive = $true
+    
+    # Create a timer that checks PSModulePath every 100ms
+    $script:PathCheckTimer = New-Object System.Timers.Timer
+    $script:PathCheckTimer.Interval = 100
+    $script:PathCheckTimer.AutoReset = $true
+    
+    # Register the event handler
+    $eventAction = {
+        if ($script:PathProtectionActive -and $env:PSModulePath -ne $script:ProtectedPSModulePath) {
+            Write-Verbose "PSModulePath was modified by auto-loading, restoring protected path"
+            $env:PSModulePath = $script:ProtectedPSModulePath
+        }
+    }
+    
+    Register-ObjectEvent -InputObject $script:PathCheckTimer -EventName Elapsed -Action $eventAction | Out-Null
+    $script:PathCheckTimer.Start()
+    
+    Write-Verbose "PSModulePath protection enabled with path: $ProtectedPath"
+}
+
+function Disable-PSModulePathProtection {
+    <#
+    .SYNOPSIS
+        Disables PSModulePath protection.
+    
+    .DESCRIPTION
+        Stops the timer-based monitoring and cleans up event handlers.
+    #>
+    [CmdletBinding()]
+    param()
+    
+    if (-not $script:PathProtectionActive) {
+        Write-Verbose "PSModulePath protection already inactive"
+        return
+    }
+    
+    $script:PathProtectionActive = $false
+    
+    if ($script:PathCheckTimer) {
+        $script:PathCheckTimer.Stop()
+        
+        # Remove all event handlers for this timer
+        Get-EventSubscriber | Where-Object { 
+            $_.SourceObject -eq $script:PathCheckTimer 
+        } | Unregister-Event -Force
+        
+        $script:PathCheckTimer.Dispose()
+        $script:PathCheckTimer = $null
+    }
+    
+    $script:ProtectedPSModulePath = $null
+    Write-Verbose "PSModulePath protection disabled"
+}
+
+function Test-PSModulePathProtection {
+    <#
+    .SYNOPSIS
+        Tests if PSModulePath protection is currently active.
+    
+    .DESCRIPTION
+        Returns true if path protection is active, false otherwise.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+    
+    return $script:PathProtectionActive
+}
+
+function Get-ProtectedPSModulePath {
+    <#
+    .SYNOPSIS
+        Gets the currently protected PSModulePath.
+    
+    .DESCRIPTION
+        Returns the path that is being protected, or null if protection is not active.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+    
+    return $script:ProtectedPSModulePath
+}
+
+# ========================================
+# FILE: Private/ModuleHooks.ps1
+# ========================================
+
+$script:OriginalImportModule = $null
+$script:HooksActive = $false
+$script:ImportModuleEventSubscriber = $null
+
+function Enable-ModuleImportHooks {
+    <#
+    .SYNOPSIS
+        Enables module import hooks to maintain virtual environment isolation.
+    
+    .DESCRIPTION
+        Creates hooks around Import-Module to ensure PSModulePath is maintained
+        even when modules are imported automatically or manually.
+    #>
+    [CmdletBinding()]
+    param()
+    
+    if ($script:HooksActive) {
+        Write-Verbose "Module import hooks already active"
+        return
+    }
+    
+    # Store the original Import-Module command
+    $script:OriginalImportModule = Get-Command Import-Module -CommandType Cmdlet
+    
+    # Create a wrapper function that maintains PSModulePath
+    $wrapperFunction = {
+        param(
+            [Parameter(ValueFromPipeline = $true, ValueFromPipelineByPropertyName = $true, Position = 0)]
+            [string[]]$Name,
+            
+            [switch]$Force,
+            [switch]$Global,
+            [switch]$PassThru,
+            [switch]$AsCustomObject,
+            [switch]$NoClobber,
+            [switch]$DisableNameChecking,
+            [switch]$SkipEditionCheck,
+            
+            [version]$MinimumVersion,
+            [string]$MaximumVersion,
+            [version]$RequiredVersion,
+            [object[]]$ArgumentList,
+            [string]$Scope,
+            [string]$Prefix,
+            [string[]]$Function,
+            [string[]]$Cmdlet,
+            [string[]]$Variable,
+            [string[]]$Alias
+        )
+        
+        # Store current protected path
+        $protectedPath = if (Test-PSModulePathProtection) { Get-ProtectedPSModulePath } else { $null }
+        
+        try {
+            # Build parameters for original Import-Module
+            $importParams = @{}
+            foreach ($param in $PSBoundParameters.GetEnumerator()) {
+                $importParams[$param.Key] = $param.Value
+            }
+            
+            # Call original Import-Module
+            $result = & $script:OriginalImportModule @importParams
+            
+            # Restore protected path if it was changed and we're in a virtual environment
+            if ($protectedPath -and $env:PSModulePath -ne $protectedPath) {
+                Write-Verbose "Import-Module changed PSModulePath, restoring virtual environment path"
+                $env:PSModulePath = $protectedPath
+            }
+            
+            return $result
+            
+        } catch {
+            # Ensure path is restored even on error
+            if ($protectedPath -and $env:PSModulePath -ne $protectedPath) {
+                $env:PSModulePath = $protectedPath
+            }
+            throw
+        }
+    }
+    
+    # Replace Import-Module with our wrapper
+    Set-Item -Path function:global:Import-Module -Value $wrapperFunction -Force
+    
+    $script:HooksActive = $true
+    Write-Verbose "Module import hooks enabled"
+}
+
+function Disable-ModuleImportHooks {
+    <#
+    .SYNOPSIS
+        Disables module import hooks.
+    
+    .DESCRIPTION
+        Restores the original Import-Module cmdlet and removes hooks.
+    #>
+    [CmdletBinding()]
+    param()
+    
+    if (-not $script:HooksActive) {
+        Write-Verbose "Module import hooks already inactive"
+        return
+    }
+    
+    # Restore original Import-Module
+    if ($script:OriginalImportModule) {
+        # Remove our custom function and let the original cmdlet take precedence
+        Remove-Item -Path function:global:Import-Module -Force -ErrorAction SilentlyContinue
+        $script:OriginalImportModule = $null
+    }
+    
+    $script:HooksActive = $false
+    Write-Verbose "Module import hooks disabled"
+}
+
+# ========================================
+# MODIFIED FILE: Public/Activate-PSVirtualEnv.ps1
+# ========================================
+
+function Activate-PSVirtualEnv {
+    <#
+    .SYNOPSIS
+        Activates a PowerShell virtual environment in the current session.
+    
+    .DESCRIPTION
+        Activates a PowerShell virtual environment by modifying the PSModulePath to prioritize
+        the environment's module directory. Also updates the prompt to show the active environment
+        and enables protection against PowerShell's auto-loading mechanism.
+    
+    .PARAMETER Name
+        Name of the environment to activate.
+    
+    .PARAMETER Scope
+        Scope of activation (Session, Global). Defaults to Session.
+        Note: Global scope is not recommended as it affects all PowerShell sessions.
+    
+    .EXAMPLE
+        Activate-PSVirtualEnv -Name "WebProject"
+        Activates the "WebProject" environment in the current session.
+    
+    .EXAMPLE
+        Activate-PSVirtualEnv -Name "Testing" -Scope Global
+        Activates the "Testing" environment globally (not recommended).
+    #>
+    [CmdletBinding()]
+    [OutputType([void])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Name,
+        
+        [Parameter()]
+        [ValidateSet('Session', 'Global')]
+        [string]$Scope = 'Session'
+    )
+    
+    begin {
+        Write-Verbose "Activating PowerShell virtual environment: $Name"
+    }
+    
+    process {
+        # Check if another environment is already active
+        if (Test-EnvironmentActive) {
+            $activeEnv = Get-ActiveEnvironment
+            Write-Warning "Environment '$($activeEnv.Name)' is currently active. Deactivating it first."
+            Deactivate-PSVirtualEnv
+        }
+        
+        # Get environment from registry
+        $environment = Get-EnvironmentFromRegistry -Name $Name
+        
+        if (-not $environment) {
+            Write-Error "Environment '$Name' not found. Use Get-PSVirtualEnv to list available environments."
+            return
+        }
+        
+        # Verify environment path exists
+        if (-not (Test-Path $environment.Path)) {
+            Write-Error "Environment path '$($environment.Path)' does not exist. The environment may be corrupted."
+            return
+        }
+        
+        try {
+            # Store original PSModulePath
+            $script:OriginalPSModulePath = $env:PSModulePath
+            Write-Verbose "Stored original PSModulePath"
+            
+            # Set new PSModulePath
+            Set-PSModulePathForEnvironment -EnvironmentPath $environment.Path -IncludeSystemModules:$environment.Settings.includeSystemModules
+            Write-Verbose "Updated PSModulePath for environment"
+            
+            # Store the protected path
+            $protectedPath = $env:PSModulePath
+            
+            # Store original prompt function
+            $script:OriginalPromptFunction = (Get-Command prompt -ErrorAction SilentlyContinue).ScriptBlock
+            
+            # Update prompt to show active environment
+            $promptFunction = {
+                if ($script:ActiveEnvironment) {
+                    Write-Host "($($script:ActiveEnvironment.Name)) " -NoNewline -ForegroundColor Green
+                }
+                if ($script:OriginalPromptFunction) {
+                    & $script:OriginalPromptFunction
+                } else {
+                    "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "
+                }
+            }
+            
+            Set-Item -Path function:prompt -Value $promptFunction
+            Write-Verbose "Updated prompt function"
+            
+            # Set active environment
+            $script:ActiveEnvironment = @{
+                Name = $environment.Name
+                Path = $environment.Path
+                OriginalPath = $script:OriginalPSModulePath
+                ProtectedPath = $protectedPath
+            }
+            
+            # ENHANCEMENT: Enable PSModulePath protection
+            Enable-PSModulePathProtection -ProtectedPath $protectedPath
+            
+            # ENHANCEMENT: Enable module import hooks
+            Enable-ModuleImportHooks
+            
+            # ENHANCEMENT: Register PowerShell idle event handler as backup
+            $idleAction = {
+                if ($script:ActiveEnvironment -and $env:PSModulePath -ne $script:ActiveEnvironment.ProtectedPath) {
+                    Write-Verbose "PowerShell idle event detected path change, restoring"
+                    $env:PSModulePath = $script:ActiveEnvironment.ProtectedPath
+                }
+            }
+            
+            Register-EngineEvent -SourceIdentifier PowerShell.OnIdle -Action $idleAction | Out-Null
+            
+            # ENHANCEMENT: Pre-load critical modules that might trigger auto-loading
+            $criticalModules = @('Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Security')
+            foreach ($module in $criticalModules) {
+                if (Get-Module -Name $module -ListAvailable -ErrorAction SilentlyContinue) {
+                    Import-Module $module -Force -Global -ErrorAction SilentlyContinue
+                }
+            }
+            
+            # Log activation
+            $logPath = Join-Path $environment.Path "Logs\activation.log"
+            $logDir = Split-Path $logPath -Parent
+            if (-not (Test-Path $logDir)) {
+                New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+            }
+            $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Environment activated by $env:USERNAME (with auto-loading protection)"
+            Add-Content -Path $logPath -Value $logEntry -ErrorAction SilentlyContinue
+            
+            Write-Information "Successfully activated virtual environment '$Name' with auto-loading protection" -InformationAction Continue
+            Write-Information "Module installations will now be isolated to this environment" -InformationAction Continue
+            
+        } catch {
+            Write-Error "Failed to activate virtual environment: $_"
+            
+            # Rollback changes
+            try {
+                Disable-PSModulePathProtection
+                Disable-ModuleImportHooks
+                Get-EventSubscriber | Where-Object { $_.SourceIdentifier -eq 'PowerShell.OnIdle' } | Unregister-Event -Force
+                
+                if ($script:OriginalPSModulePath) {
+                    $env:PSModulePath = $script:OriginalPSModulePath
+                    $script:OriginalPSModulePath = $null
+                }
+                $script:ActiveEnvironment = $null
+            } catch {
+                Write-Warning "Failed to properly rollback activation changes: $_"
+            }
+        }
+    }
+}
+
+# ========================================
+# MODIFIED FILE: Public/Deactivate-PSVirtualEnv.ps1
+# ========================================
+
+function Deactivate-PSVirtualEnv {
+    <#
+    .SYNOPSIS
+        Deactivates the currently active PowerShell virtual environment.
+    
+    .DESCRIPTION
+        Deactivates the currently active PowerShell virtual environment by restoring
+        the original PSModulePath and prompt function, and disabling auto-loading protection.
+    
+    .EXAMPLE
+        Deactivate-PSVirtualEnv
+        Deactivates the currently active environment.
+    #>
+    [CmdletBinding()]
+    [OutputType([void])]
+    param()
+    
+    begin {
+        Write-Verbose "Deactivating PowerShell virtual environment"
+    }
+    
+    process {
+        # Check if any environment is active
+        if (-not (Test-EnvironmentActive)) {
+            Write-Warning "No virtual environment is currently active."
+            return
+        }
+        
+        $activeEnv = Get-ActiveEnvironment
+        
+        try {
+            # ENHANCEMENT: Disable path protection first
+            Write-Verbose "Disabling PSModulePath protection"
+            Disable-PSModulePathProtection
+            
+            # ENHANCEMENT: Disable module import hooks
+            Write-Verbose "Disabling module import hooks"
+            Disable-ModuleImportHooks
+            
+            # ENHANCEMENT: Unregister event handlers
+            Write-Verbose "Unregistering PowerShell idle event handlers"
+            Get-EventSubscriber | Where-Object { 
+                $_.SourceIdentifier -eq 'PowerShell.OnIdle' 
+            } | Unregister-Event -Force
+            
+            # Restore original PSModulePath
+            Restore-OriginalPSModulePath
+            Write-Verbose "Restored original PSModulePath"
+            
+            # Restore original prompt function
+            if ($script:OriginalPromptFunction) {
+                Set-Item -Path function:prompt -Value $script:OriginalPromptFunction
+                $script:OriginalPromptFunction = $null
+                Write-Verbose "Restored original prompt function"
+            } else {
+                # Set default prompt if no original was stored
+                Set-Item -Path function:prompt -Value {
+                    "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "
+                }
+            }
+            
+            # Log deactivation
+            $environment = Get-EnvironmentFromRegistry -Name $activeEnv.Name
+            if ($environment) {
+                $logPath = Join-Path $environment.Path "Logs\activation.log"
+                $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Environment deactivated by $env:USERNAME (protection disabled)"
+                Add-Content -Path $logPath -Value $logEntry -ErrorAction SilentlyContinue
+            }
+            
+            # Clear active environment
+            $envName = $script:ActiveEnvironment.Name
+            $script:ActiveEnvironment = $null
+            
+            Write-Information "Successfully deactivated virtual environment '$envName'" -InformationAction Continue
+            
+        } catch {
+            Write-Error "Failed to deactivate virtual environment: $_"
+            
+            # Attempt emergency cleanup
+            try {
+                Write-Warning "Attempting emergency cleanup of virtual environment state"
+                Disable-PSModulePathProtection
+                Disable-ModuleImportHooks
+                Get-EventSubscriber | Unregister-Event -Force -ErrorAction SilentlyContinue
+                $script:ActiveEnvironment = $null
+            } catch {
+                Write-Error "Emergency cleanup failed: $_"
+            }
+        }
+    }
+}
+
+# ========================================
+# MODIFIED FILE: PSVirtualEnv.psm1
+# ========================================
+
+# Module variables
+$script:ActiveEnvironment = $null
+$script:OriginalPSModulePath = $null
+$script:OriginalPromptFunction = $null
+$script:RegistryPath = $null
+
+# Set cross-platform home directory
+if ($PSVersionTable.PSEdition -eq 'Core' -and $PSVersionTable.Platform -eq 'Unix') {
+    $script:PSVirtualEnvHome = Join-Path $HOME '.psvirtualenv'
+} else {
+    $script:PSVirtualEnvHome = Join-Path $env:USERPROFILE '.psvirtualenv'
+}
+
+# Import classes first (before using them)
+#. $PSScriptRoot\Classes\PSVirtualEnvironment.ps1
+
+# Import private functions
+Get-ChildItem -Path $PSScriptRoot\Private\*.ps1 -ErrorAction SilentlyContinue | ForEach-Object {
+    . $_.FullName
+}
+
+# Import public functions and collect their names
+$publicFunctions = @()
+Get-ChildItem -Path $PSScriptRoot\Public\*.ps1 -ErrorAction SilentlyContinue | ForEach-Object {
+    . $_.FullName
+    # Extract function name from file name
+    $publicFunctions += [System.IO.Path]::GetFileNameWithoutExtension($_.Name)
+}
+
+# Initialize module
+if (-not (Test-Path $script:PSVirtualEnvHome)) {
+    New-Item -Path $script:PSVirtualEnvHome -ItemType Directory -Force | Out-Null
+}
+
+$script:RegistryPath = Join-Path $script:PSVirtualEnvHome 'registry.json'
+if (-not (Test-Path $script:RegistryPath)) {
+    @() | ConvertTo-Json | Set-Content -Path $script:RegistryPath -Encoding UTF8
+}
+
+# ENHANCEMENT: Register module removal event to clean up protection systems
+$MyInvocation.MyCommand.ScriptBlock.Module.OnRemove = {
+    Write-Verbose "PSVirtualEnv module being removed, cleaning up protection systems"
+    
+    try {
+        # Disable all protection systems
+        if (Get-Command Disable-PSModulePathProtection -ErrorAction SilentlyContinue) {
+            Disable-PSModulePathProtection
+        }
+        
+        if (Get-Command Disable-ModuleImportHooks -ErrorAction SilentlyContinue) {
+            Disable-ModuleImportHooks
+        }
+        
+        # Clean up any remaining event subscribers
+        Get-EventSubscriber | Where-Object { 
+            $_.SourceIdentifier -eq 'PowerShell.OnIdle' 
+        } | Unregister-Event -Force -ErrorAction SilentlyContinue
+        
+        # If an environment was active, attempt to restore original state
+        if ($script:ActiveEnvironment -and $script:OriginalPSModulePath) {
+            $env:PSModulePath = $script:OriginalPSModulePath
+            Write-Verbose "Restored original PSModulePath during module cleanup"
+        }
+    } catch {
+        Write-Warning "Error during PSVirtualEnv module cleanup: $_"
+    }
+}
+
+# Export module members - use the actual function names
+Export-ModuleMember -Function $publicFunctions
+
+# ========================================
+# TESTING SCRIPT: Test-AutoLoadingProtection.ps1
+# ========================================
+
+<#
+.SYNOPSIS
+    Test script to verify that auto-loading protection is working correctly.
+
+.DESCRIPTION
+    This script tests the PSVirtualEnv auto-loading protection by:
+    1. Creating a test environment
+    2. Activating it
+    3. Triggering PowerShell auto-loading
+    4. Verifying that PSModulePath remains protected
+
+.EXAMPLE
+    .\Test-AutoLoadingProtection.ps1
+#>
+
+function Test-AutoLoadingProtection {
+    [CmdletBinding()]
+    param()
+    
+    Write-Host "Testing PSVirtualEnv Auto-Loading Protection" -ForegroundColor Yellow
+    Write-Host "=" * 50 -ForegroundColor Yellow
+    
+    try {
+        # Create a test environment
+        $testEnvName = "AutoLoadTest_$(Get-Random)"
+        Write-Host "Creating test environment: $testEnvName" -ForegroundColor Green
+        New-PSVirtualEnv -Name $testEnvName -Force
+        
+        # Activate the environment
+        Write-Host "Activating environment..." -ForegroundColor Green
+        Activate-PSVirtualEnv -Name $testEnvName
+        
+        # Store the protected path
+        $protectedPath = $env:PSModulePath
+        Write-Host "Protected PSModulePath: $protectedPath" -ForegroundColor Cyan
+        
+        # Test 1: Manual Import-Module
+        Write-Host "`nTest 1: Manual Import-Module" -ForegroundColor Yellow
+        $pathBeforeImport = $env:PSModulePath
+        Import-Module Microsoft.PowerShell.Management -Force
+        $pathAfterImport = $env:PSModulePath
+        
+        if ($pathBeforeImport -eq $pathAfterImport) {
+            Write-Host "✓ Manual Import-Module protection: PASSED" -ForegroundColor Green
+        } else {
+            Write-Host "✗ Manual Import-Module protection: FAILED" -ForegroundColor Red
+            Write-Host "  Before: $pathBeforeImport" -ForegroundColor Red
+            Write-Host "  After:  $pathAfterImport" -ForegroundColor Red
+        }
+        
+        # Test 2: Auto-loading trigger
+        Write-Host "`nTest 2: Auto-loading trigger (Get-Process)" -ForegroundColor Yellow
+        $pathBeforeAuto = $env:PSModulePath
+        
+        # Remove the Management module to force auto-loading
+        Remove-Module Microsoft.PowerShell.Management -Force -ErrorAction SilentlyContinue
+        
+        # This should trigger auto-loading
+        Get-Process | Select-Object -First 1 | Out-Null
+        
+        # Wait a moment for protection to kick in
+        Start-Sleep -Milliseconds 200
+        
+        $pathAfterAuto = $env:PSModulePath
+        
+        if ($pathBeforeAuto -eq $pathAfterAuto) {
+            Write-Host "✓ Auto-loading protection: PASSED" -ForegroundColor Green
+        } else {
+            Write-Host "✗ Auto-loading protection: FAILED" -ForegroundColor Red
+            Write-Host "  Before: $pathBeforeAuto" -ForegroundColor Red
+            Write-Host "  After:  $pathAfterAuto" -ForegroundColor Red
+        }
+        
+        # Test 3: Protection status
+        Write-Host "`nTest 3: Protection status" -ForegroundColor Yellow
+        if (Test-PSModulePathProtection) {
+            Write-Host "✓ Protection is active: PASSED" -ForegroundColor Green
+        } else {
+            Write-Host "✗ Protection is not active: FAILED" -ForegroundColor Red
+        }
+        
+        # Test 4: Current path matches protected path
+        Write-Host "`nTest 4: Path integrity" -ForegroundColor Yellow
+        $currentPath = $env:PSModulePath
+        $expectedPath = Get-ProtectedPSModulePath
+        
+        if ($currentPath -eq $expectedPath) {
+            Write-Host "✓ Path integrity maintained: PASSED" -ForegroundColor Green
+        } else {
+            Write-Host "✗ Path integrity compromised: FAILED" -ForegroundColor Red
+            Write-Host "  Current:  $currentPath" -ForegroundColor Red
+            Write-Host "  Expected: $expectedPath" -ForegroundColor Red
+        }
+        
+        Write-Host "`nProtection test completed!" -ForegroundColor Yellow
+        
+    } finally {
+        # Clean up
+        Write-Host "`nCleaning up test environment..." -ForegroundColor Green
+        Deactivate-PSVirtualEnv -ErrorAction SilentlyContinue
+        if ($testEnvName) {
+            Remove-PSVirtualEnv -Name $testEnvName -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# Run the test if this script is executed directly
+if ($MyInvocation.InvocationName -ne '.') {
+    Test-AutoLoadingProtection
+}
