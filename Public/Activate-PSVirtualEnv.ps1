@@ -1,26 +1,7 @@
 function Activate-PSVirtualEnv {
     <#
     .SYNOPSIS
-        Activates a PowerShell virtual environment in the current session.
-    
-    .DESCRIPTION
-        Activates a PowerShell virtual environment by modifying the PSModulePath to prioritize
-        the environment's module directory. Also updates the prompt to show the active environment.
-    
-    .PARAMETER Name
-        Name of the environment to activate.
-    
-    .PARAMETER Scope
-        Scope of activation (Session, Global). Defaults to Session.
-        Note: Global scope is not recommended as it affects all PowerShell sessions.
-    
-    .EXAMPLE
-        Activate-PSVirtualEnv -Name "WebProject"
-        Activates the "WebProject" environment in the current session.
-    
-    .EXAMPLE
-        Activate-PSVirtualEnv -Name "Testing" -Scope Global
-        Activates the "Testing" environment globally (not recommended).
+        Activates a PowerShell virtual environment with true isolation.
     #>
     [CmdletBinding()]
     [OutputType([void])]
@@ -35,7 +16,7 @@ function Activate-PSVirtualEnv {
     )
     
     begin {
-        Write-Verbose "Activating PowerShell virtual environment: $Name"
+        Write-Verbose "Activating PowerShell virtual environment with true isolation: $Name"
     }
     
     process {
@@ -65,9 +46,11 @@ function Activate-PSVirtualEnv {
             $script:OriginalPSModulePath = $env:PSModulePath
             Write-Verbose "Stored original PSModulePath"
             
-            # Set new PSModulePath
-            Set-PSModulePathForEnvironment -EnvironmentPath $environment.Path -IncludeSystemModules:$environment.Settings.includeSystemModules
-            Write-Verbose "Updated PSModulePath for environment"
+            # Initialize isolated operations
+            Initialize-IsolatedOperations
+            
+            # Set strict isolation
+            Set-VirtualEnvironmentIsolation -EnvironmentPath $environment.Path
             
             # Store original prompt function
             $script:OriginalPromptFunction = (Get-Command prompt -ErrorAction SilentlyContinue).ScriptBlock
@@ -79,8 +62,7 @@ function Activate-PSVirtualEnv {
                 }
                 if ($script:OriginalPromptFunction) {
                     & $script:OriginalPromptFunction
-                }
-                else {
+                } else {
                     "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "
                 }
             }
@@ -90,53 +72,30 @@ function Activate-PSVirtualEnv {
             
             # Set active environment
             $script:ActiveEnvironment = @{
-                Name         = $environment.Name
-                Path         = $environment.Path
+                Name = $environment.Name
+                Path = $environment.Path
                 OriginalPath = $script:OriginalPSModulePath
-            }
-
-            # ENHANCEMENT: Enable PSModulePath protection
-            Enable-PSModulePathProtection -ProtectedPath $script:ActiveEnvironment.path
-            
-            # ENHANCEMENT: Enable module import hooks
-            Enable-ModuleImportHooks
-            
-            # ENHANCEMENT: Register PowerShell idle event handler as backup
-            $idleAction = {
-                if ($script:ActiveEnvironment -and $env:PSModulePath -ne $script:ActiveEnvironment.path) {
-                    Write-Verbose "PowerShell idle event detected path change, restoring"
-                    $env:PSModulePath = $script:ActiveEnvironment.path
-                }
-            }
-            
-            Register-EngineEvent -SourceIdentifier PowerShell.OnIdle -Action $idleAction | Out-Null
-            
-            # ENHANCEMENT: Pre-load critical modules that might trigger auto-loading
-            $criticalModules = @('Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Security')
-            foreach ($module in $criticalModules) {
-                if (Get-Module -Name $module -ListAvailable -ErrorAction SilentlyContinue) {
-                    Import-Module $module -Force -Global -ErrorAction SilentlyContinue
-                }
             }
             
             # Log activation
             $logPath = Join-Path $environment.Path "Logs\activation.log"
-            $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Environment activated by $env:USERNAME"
+            $logDir = Split-Path $logPath -Parent
+            if (-not (Test-Path $logDir)) {
+                New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+            }
+            $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Environment activated with true isolation by $env:USERNAME"
             Add-Content -Path $logPath -Value $logEntry -ErrorAction SilentlyContinue
             
-            Write-Information "Successfully activated virtual environment '$Name'" -InformationAction Continue
-            Write-Information "Module installations will now be isolated to this environment" -InformationAction Continue
+            Write-Information "Successfully activated virtual environment '$Name' with TRUE ISOLATION" -InformationAction Continue
+            Write-Information "Only modules installed in this environment will be available" -InformationAction Continue
+            Write-Information "Use Install-PSModuleInEnv to add modules to this environment" -InformationAction Continue
             
-        }
-        catch {
+        } catch {
             Write-Error "Failed to activate virtual environment: $_"
             
             # Rollback changes
             try {
-                Disable-PSModulePathProtection
-                Disable-ModuleImportHooks
-                Get-EventSubscriber | Where-Object { $_.SourceIdentifier -eq 'PowerShell.OnIdle' } | Unregister-Event -Force
-                
+                Remove-VirtualEnvironmentIsolation
                 if ($script:OriginalPSModulePath) {
                     $env:PSModulePath = $script:OriginalPSModulePath
                     $script:OriginalPSModulePath = $null

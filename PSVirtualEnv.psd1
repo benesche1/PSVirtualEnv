@@ -24,7 +24,8 @@
         'Install-PSModuleInEnv',
         'Uninstall-PSModuleInEnv',
         'Get-PSModuleInEnv',
-        'Update-PSModuleInEnv'
+        'Update-PSModuleInEnv',
+        'Import-PSModuleInEnv'
     )
     
     # Cmdlets to export

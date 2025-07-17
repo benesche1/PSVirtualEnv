@@ -1,38 +1,11 @@
 function Install-PSModuleInEnv {
     <#
     .SYNOPSIS
-        Installs a PowerShell module into the active virtual environment.
+        Installs a PowerShell module into the active virtual environment with true isolation.
     
     .DESCRIPTION
-        Installs a PowerShell module from a repository (default: PSGallery) into the
-        currently active virtual environment's module directory. The module will only
-        be available when the environment is active.
-    
-    .PARAMETER Name
-        Module name to install. Supports wildcards for searching.
-    
-    .PARAMETER RequiredVersion
-        Specific version to install. If not specified, installs the latest version.
-    
-    .PARAMETER Repository
-        Repository to install from. Defaults to PSGallery.
-    
-    .PARAMETER Scope
-        Always set to CurrentUser for environment isolation. This parameter is ignored.
-    
-    .PARAMETER Force
-        Force installation even if the module already exists.
-    
-    .PARAMETER AllowPrerelease
-        Allow installation of prerelease versions.
-    
-    .EXAMPLE
-        Install-PSModuleInEnv -Name "Pester" -RequiredVersion "5.3.0"
-        Installs Pester version 5.3.0 into the active environment.
-    
-    .EXAMPLE
-        Install-PSModuleInEnv -Name "PSScriptAnalyzer" -Force
-        Installs the latest version of PSScriptAnalyzer, overwriting if it exists.
+        Installs a PowerShell module from a repository into the currently active virtual 
+        environment without contaminating the current session with global modules.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([void])]
@@ -48,10 +21,6 @@ function Install-PSModuleInEnv {
         [string]$Repository = 'PSGallery',
         
         [Parameter()]
-        [ValidateSet('CurrentUser', 'AllUsers')]
-        [string]$Scope = 'CurrentUser',
-        
-        [Parameter()]
         [switch]$Force,
         
         [Parameter()]
@@ -59,7 +28,7 @@ function Install-PSModuleInEnv {
     )
     
     begin {
-        Write-Verbose "Installing module '$Name' into virtual environment"
+        Write-Verbose "Installing module '$Name' into virtual environment with true isolation"
         
         # Verify environment is active
         if (-not (Test-EnvironmentActive)) {
@@ -76,102 +45,30 @@ function Install-PSModuleInEnv {
             return
         }
         
-        $modulePath = Join-Path $environment.Path 'Modules'
-        
-        # ENHANCEMENT: Request temporary bypass before module operations
-        if (Test-PSModulePathProtection) {
-            Write-Verbose "Requesting temporary path bypass for module installation"
-            Request-TemporaryPathBypass -DurationSeconds 60  # Longer bypass for installations
-        }
-
-        # Build Install-Module parameters
-        $installParams = @{
-            Name            = $Name
-            Repository      = $Repository
-            Scope           = 'CurrentUser'
-            Force           = $Force.IsPresent
-            AllowPrerelease = $AllowPrerelease.IsPresent
-            ErrorAction     = 'Stop'
-        }
-        
-        if ($RequiredVersion) {
-            $installParams['RequiredVersion'] = $RequiredVersion
-        }
-        
-        # Add Path parameter to force installation to environment directory
-        $installParams['Path'] = $modulePath
-        
         if ($PSCmdlet.ShouldProcess("$Name in environment '$($environment.Name)'", "Install module")) {
-            # try {
-            Write-Information "Installing module '$Name' from repository '$Repository'..." -InformationAction Continue
-                
-            # Temporarily modify PSModulePath to ensure proper installation
-            #    $originalPath = $env:PSModulePath
-            #   $env:PSModulePath = "$modulePath;$originalPath"
-                
             try {
-                # Find the module first to get version info
-                $findParams = @{
-                    Name        = $Name
-                    Repository  = $Repository
-                    ErrorAction = 'Stop'
-                }
-                    
-                if ($RequiredVersion) {
-                    $findParams['RequiredVersion'] = $RequiredVersion
-                }
-                    
-                if ($AllowPrerelease) {
-                    $findParams['AllowPrerelease'] = $true
-                }
-                    
-                $moduleToInstall = Find-Module @findParams | Select-Object -First 1
-                    
-                if (-not $moduleToInstall) {
-                    throw "Module '$Name' not found in repository '$Repository'"
-                }
-                    
-                # Save the module to the environment path
-                $saveParams = @{
-                    Name        = $moduleToInstall.Name
-                    Path        = $modulePath
-                    Repository  = $Repository
-                    Force       = $Force.IsPresent
-                    ErrorAction = 'Stop'
-                }
-                    
-                if ($RequiredVersion) {
-                    $saveParams['RequiredVersion'] = $RequiredVersion
-                }
-                else {
-                    $saveParams['RequiredVersion'] = $moduleToInstall.Version.ToString()
-                }
-                    
-                if ($AllowPrerelease) {
-                    $saveParams['AllowPrerelease'] = $true
-                }
-                    
-                Save-Module @saveParams
-                    
+                Write-Information "Installing module '$Name' from repository '$Repository' with isolation..." -InformationAction Continue
+                
+                # Use isolated installation method
+                $moduleInfo = Install-ModuleToEnvironment -Name $Name -EnvironmentPath $environment.Path -RequiredVersion $RequiredVersion -Repository $Repository -Force:$Force -AllowPrerelease:$AllowPrerelease
+                
                 # Update environment configuration
-                $environment.AddModule($moduleToInstall.Name, $moduleToInstall.Version.ToString())
+                $environment.AddModule($moduleInfo.Name, $moduleInfo.Version.ToString())
                 Set-EnvironmentConfig -Environment $environment
-                    
+                Add-EnvironmentToRegistry -Environment $environment
+                
                 # Log installation
                 $logPath = Join-Path $environment.Path "Logs\modules.log"
-                $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Installed: $($moduleToInstall.Name) v$($moduleToInstall.Version)"
+                $logDir = Split-Path $logPath -Parent
+                if (-not (Test-Path $logDir)) {
+                    New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+                }
+                $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Installed (isolated): $($moduleInfo.Name) v$($moduleInfo.Version)"
                 Add-Content -Path $logPath -Value $logEntry -ErrorAction SilentlyContinue
-                    
-                Write-Information "Successfully installed module '$($moduleToInstall.Name)' version $($moduleToInstall.Version)" -InformationAction Continue
-                    
-                #}
-                #finally {
-                # Restore original PSModulePath
-                #    $env:PSModulePath = $originalPath
-                #}
                 
-            }
-            catch {
+                Write-Information "Successfully installed module '$($moduleInfo.Name)' version $($moduleInfo.Version) with true isolation" -InformationAction Continue
+                
+            } catch {
                 Write-Error "Failed to install module '$Name': $_"
             }
         }

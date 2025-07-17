@@ -2,14 +2,6 @@ function Deactivate-PSVirtualEnv {
     <#
     .SYNOPSIS
         Deactivates the currently active PowerShell virtual environment.
-    
-    .DESCRIPTION
-        Deactivates the currently active PowerShell virtual environment by restoring
-        the original PSModulePath and prompt function.
-    
-    .EXAMPLE
-        Deactivate-PSVirtualEnv
-        Deactivates the currently active environment.
     #>
     [CmdletBinding()]
     [OutputType([void])]
@@ -29,35 +21,15 @@ function Deactivate-PSVirtualEnv {
         $activeEnv = Get-ActiveEnvironment
         
         try {
-
-            # ENHANCEMENT: Disable path protection first
-            Write-Verbose "Disabling PSModulePath protection"
-            Disable-PSModulePathProtection
-            
-            # ENHANCEMENT: Disable module import hooks
-            Write-Verbose "Disabling module import hooks"
-            Disable-ModuleImportHooks
-            
-            # ENHANCEMENT: Unregister event handlers
-            Write-Verbose "Unregistering PowerShell idle event handlers"
-            Get-EventSubscriber | Where-Object { 
-                $_.SourceIdentifier -eq 'PowerShell.OnIdle' 
-            } | Unregister-Event -Force
-            
-            # Restore original PSModulePath
-            Restore-OriginalPSModulePath
-            Write-Verbose "Restored original PSModulePath"
-            # Restore original PSModulePath
-            Restore-OriginalPSModulePath
-            Write-Verbose "Restored original PSModulePath"
+            # Remove isolation
+            Remove-VirtualEnvironmentIsolation
             
             # Restore original prompt function
             if ($script:OriginalPromptFunction) {
                 Set-Item -Path function:prompt -Value $script:OriginalPromptFunction
                 $script:OriginalPromptFunction = $null
                 Write-Verbose "Restored original prompt function"
-            }
-            else {
+            } else {
                 # Set default prompt if no original was stored
                 Set-Item -Path function:prompt -Value {
                     "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "
@@ -68,7 +40,7 @@ function Deactivate-PSVirtualEnv {
             $environment = Get-EnvironmentFromRegistry -Name $activeEnv.Name
             if ($environment) {
                 $logPath = Join-Path $environment.Path "Logs\activation.log"
-                $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Environment deactivated by $env:USERNAME"
+                $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Environment deactivated (isolation removed) by $env:USERNAME"
                 Add-Content -Path $logPath -Value $logEntry -ErrorAction SilentlyContinue
             }
             
@@ -76,24 +48,10 @@ function Deactivate-PSVirtualEnv {
             $envName = $script:ActiveEnvironment.Name
             $script:ActiveEnvironment = $null
             
-            Write-Information "Successfully deactivated virtual environment '$envName'" -InformationAction Continue
+            Write-Information "Successfully deactivated virtual environment '$envName' and restored system access" -InformationAction Continue
             
-        }
-        catch {
+        } catch {
             Write-Error "Failed to deactivate virtual environment: $_"
-            
-            # Attempt emergency cleanup
-            try {
-                Write-Warning "Attempting emergency cleanup of virtual environment state"
-                Disable-PSModulePathProtection
-                Disable-ModuleImportHooks
-                Get-EventSubscriber | Unregister-Event -Force -ErrorAction SilentlyContinue
-                $script:ActiveEnvironment = $null
-            }
-            catch {
-                Write-Error "Emergency cleanup failed: $_"
-            }
-        
         }
     }
 }

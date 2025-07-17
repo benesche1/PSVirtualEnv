@@ -1,0 +1,660 @@
+# ========================================
+# NEW APPROACH: Isolated Module Operations
+# ========================================
+
+# ========================================
+# FILE: Private/IsolatedOperations.ps1
+# ========================================
+
+$script:SystemPSModulePath = $null
+$script:IsolationActive = $false
+
+function Initialize-IsolatedOperations {
+    <#
+    .SYNOPSIS
+        Initializes the isolated operations system.
+    #>
+    [CmdletBinding()]
+    param()
+    
+    if (-not $script:SystemPSModulePath) {
+        # Store the original system PSModulePath permanently
+        $script:SystemPSModulePath = $env:PSModulePath
+        Write-Verbose "Stored system PSModulePath: $($script:SystemPSModulePath)"
+    }
+}
+
+function Invoke-WithSystemModules {
+    <#
+    .SYNOPSIS
+        Executes a script block with temporary access to system modules.
+        
+    .DESCRIPTION
+        Temporarily restores system PSModulePath, executes the script block,
+        then immediately restores the virtual environment path. This allows
+        essential operations like Find-Module and Save-Module to work without
+        contaminating the virtual environment.
+        
+    .PARAMETER ScriptBlock
+        The script block to execute with system module access.
+        
+    .PARAMETER TimeoutSeconds
+        Maximum time to allow system access (safety mechanism).
+        
+    .EXAMPLE
+        Invoke-WithSystemModules { Find-Module -Name "Pester" }
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [scriptblock]$ScriptBlock,
+        
+        [Parameter()]
+        [int]$TimeoutSeconds = 30
+    )
+    
+    if (-not $script:IsolationActive) {
+        # Not in virtual environment, just execute normally
+        return & $ScriptBlock
+    }
+    
+    $currentPath = $env:PSModulePath
+    $startTime = Get-Date
+    
+    try {
+        Write-Verbose "Temporarily enabling system modules for operation"
+        
+        # Restore system PSModulePath temporarily
+        $env:PSModulePath = $script:SystemPSModulePath
+        
+        # Execute the operation
+        $result = & $ScriptBlock
+        
+        return $result
+        
+    } catch {
+        Write-Verbose "Error during system module operation: $_"
+        throw
+    } finally {
+        # Always restore the virtual environment path
+        $env:PSModulePath = $currentPath
+        
+        $duration = ((Get-Date) - $startTime).TotalSeconds
+        Write-Verbose "System module access duration: $duration seconds"
+        
+        # Safety check - if this took too long, warn about potential issues
+        if ($duration -gt $TimeoutSeconds) {
+            Write-Warning "System module operation took longer than expected ($duration seconds). Virtual environment isolation may have been compromised."
+        }
+    }
+}
+
+function Install-ModuleToEnvironment {
+    <#
+    .SYNOPSIS
+        Installs a module directly to the virtual environment without contamination.
+        
+    .DESCRIPTION
+        Uses system modules to find and download the module, but installs it
+        directly to the virtual environment directory without affecting the
+        current session's module loading.
+        
+    .PARAMETER Name
+        Module name to install.
+        
+    .PARAMETER EnvironmentPath
+        Path to the virtual environment.
+        
+    .PARAMETER RequiredVersion
+        Specific version to install.
+        
+    .PARAMETER Repository
+        Repository to install from.
+        
+    .PARAMETER Force
+        Force installation.
+        
+    .PARAMETER AllowPrerelease
+        Allow prerelease versions.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name,
+        
+        [Parameter(Mandatory)]
+        [string]$EnvironmentPath,
+        
+        [Parameter()]
+        [string]$RequiredVersion,
+        
+        [Parameter()]
+        [string]$Repository = 'PSGallery',
+        
+        [Parameter()]
+        [switch]$Force,
+        
+        [Parameter()]
+        [switch]$AllowPrerelease
+    )
+    
+    $modulePath = Join-Path $EnvironmentPath 'Modules'
+    
+    # Ensure module directory exists
+    if (-not (Test-Path $modulePath)) {
+        New-Item -Path $modulePath -ItemType Directory -Force | Out-Null
+    }
+    
+    # Use system modules to find and download the module
+    $moduleInfo = Invoke-WithSystemModules {
+        $findParams = @{
+            Name = $Name
+            Repository = $Repository
+            ErrorAction = 'Stop'
+        }
+        
+        if ($RequiredVersion) {
+            $findParams['RequiredVersion'] = $RequiredVersion
+        }
+        
+        if ($AllowPrerelease) {
+            $findParams['AllowPrerelease'] = $true
+        }
+        
+        Write-Verbose "Finding module '$Name' in repository '$Repository'"
+        $module = Find-Module @findParams | Select-Object -First 1
+        
+        if (-not $module) {
+            throw "Module '$Name' not found in repository '$Repository'"
+        }
+        
+        Write-Verbose "Found module: $($module.Name) version $($module.Version)"
+        
+        # Download the module to the virtual environment
+        $saveParams = @{
+            Name = $module.Name
+            Path = $modulePath
+            Repository = $Repository
+            Force = $Force.IsPresent
+            ErrorAction = 'Stop'
+        }
+        
+        if ($RequiredVersion) {
+            $saveParams['RequiredVersion'] = $RequiredVersion
+        } else {
+            $saveParams['RequiredVersion'] = $module.Version.ToString()
+        }
+        
+        if ($AllowPrerelease) {
+            $saveParams['AllowPrerelease'] = $true
+        }
+        
+        Write-Verbose "Saving module to virtual environment: $modulePath"
+        Save-Module @saveParams
+        
+        return $module
+    }
+    
+    Write-Information "Successfully installed '$($moduleInfo.Name)' version $($moduleInfo.Version) to virtual environment" -InformationAction Continue
+    return $moduleInfo
+}
+
+function Import-ModuleFromEnvironment {
+    <#
+    .SYNOPSIS
+        Imports a module specifically from the virtual environment.
+        
+    .DESCRIPTION
+        Imports a module ensuring it comes from the virtual environment directory
+        and doesn't trigger auto-loading from system paths.
+        
+    .PARAMETER Name
+        Module name to import.
+        
+    .PARAMETER EnvironmentPath
+        Path to the virtual environment.
+        
+    .PARAMETER Force
+        Force import even if already loaded.
+        
+    .PARAMETER Global
+        Import to global scope.
+        
+    .PARAMETER PassThru
+        Return the module info.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name,
+        
+        [Parameter(Mandatory)]
+        [string]$EnvironmentPath,
+        
+        [Parameter()]
+        [switch]$Force,
+        
+        [Parameter()]
+        [switch]$Global,
+        
+        [Parameter()]
+        [switch]$PassThru
+    )
+    
+    $modulePath = Join-Path $EnvironmentPath 'Modules'
+    $moduleDir = Join-Path $modulePath $Name
+    
+    # Check if module exists in virtual environment
+    if (-not (Test-Path $moduleDir)) {
+        throw "Module '$Name' is not installed in the virtual environment. Use Install-PSModuleInEnv to install it first."
+    }
+    
+    # Find the module manifest or script file
+    $moduleFiles = @(
+        (Join-Path $moduleDir "$Name.psd1"),
+        (Join-Path $moduleDir "$Name.psm1"),
+        (Get-ChildItem -Path $moduleDir -Filter "*.psd1" | Select-Object -First 1).FullName,
+        (Get-ChildItem -Path $moduleDir -Filter "*.psm1" | Select-Object -First 1).FullName
+    ) | Where-Object { $_ -and (Test-Path $_) }
+    
+    if (-not $moduleFiles) {
+        throw "No valid module file found for '$Name' in virtual environment"
+    }
+    
+    $moduleFile = $moduleFiles[0]
+    
+    # Import the specific module file
+    $importParams = @{
+        Name = $moduleFile
+        Force = $Force.IsPresent
+        PassThru = $PassThru.IsPresent
+    }
+    
+    if ($Global) {
+        $importParams['Global'] = $true
+    }
+    
+    Write-Verbose "Importing module from: $moduleFile"
+    return Import-Module @importParams
+}
+
+function Set-VirtualEnvironmentIsolation {
+    <#
+    .SYNOPSIS
+        Activates strict isolation mode for the virtual environment.
+        
+    .DESCRIPTION
+        Sets up the virtual environment with strict isolation - only environment
+        modules are available, no system modules except for absolutely essential ones.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$EnvironmentPath
+    )
+    
+    # Initialize if not done
+    Initialize-IsolatedOperations
+    
+    # Set isolation active
+    $script:IsolationActive = $true
+    
+    # Set PSModulePath to ONLY the virtual environment
+    $envModulePath = Join-Path $EnvironmentPath 'Modules'
+    
+    # Create a minimal PSModulePath with only the virtual environment
+    $env:PSModulePath = $envModulePath
+    
+    Write-Verbose "Activated strict isolation. PSModulePath: $($env:PSModulePath)"
+}
+
+function Remove-VirtualEnvironmentIsolation {
+    <#
+    .SYNOPSIS
+        Deactivates virtual environment isolation.
+    #>
+    [CmdletBinding()]
+    param()
+    
+    if ($script:SystemPSModulePath) {
+        $env:PSModulePath = $script:SystemPSModulePath
+        Write-Verbose "Restored system PSModulePath"
+    }
+    
+    $script:IsolationActive = $false
+}
+
+# ========================================
+# UPDATED FILE: Public/Install-PSModuleInEnv.ps1
+# ========================================
+
+function Install-PSModuleInEnv {
+    <#
+    .SYNOPSIS
+        Installs a PowerShell module into the active virtual environment with true isolation.
+    
+    .DESCRIPTION
+        Installs a PowerShell module from a repository into the currently active virtual 
+        environment without contaminating the current session with global modules.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([void])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Name,
+        
+        [Parameter()]
+        [string]$RequiredVersion,
+        
+        [Parameter()]
+        [string]$Repository = 'PSGallery',
+        
+        [Parameter()]
+        [switch]$Force,
+        
+        [Parameter()]
+        [switch]$AllowPrerelease
+    )
+    
+    begin {
+        Write-Verbose "Installing module '$Name' into virtual environment with true isolation"
+        
+        # Verify environment is active
+        if (-not (Test-EnvironmentActive)) {
+            throw "No virtual environment is active. Use Activate-PSVirtualEnv to activate an environment first."
+        }
+    }
+    
+    process {
+        $activeEnv = Get-ActiveEnvironment
+        $environment = Get-EnvironmentFromRegistry -Name $activeEnv.Name
+        
+        if (-not $environment) {
+            Write-Error "Active environment configuration not found. The environment may be corrupted."
+            return
+        }
+        
+        if ($PSCmdlet.ShouldProcess("$Name in environment '$($environment.Name)'", "Install module")) {
+            try {
+                Write-Information "Installing module '$Name' from repository '$Repository' with isolation..." -InformationAction Continue
+                
+                # Use isolated installation method
+                $moduleInfo = Install-ModuleToEnvironment -Name $Name -EnvironmentPath $environment.Path -RequiredVersion $RequiredVersion -Repository $Repository -Force:$Force -AllowPrerelease:$AllowPrerelease
+                
+                # Update environment configuration
+                $environment.AddModule($moduleInfo.Name, $moduleInfo.Version.ToString())
+                Set-EnvironmentConfig -Environment $environment
+                Add-EnvironmentToRegistry -Environment $environment
+                
+                # Log installation
+                $logPath = Join-Path $environment.Path "Logs\modules.log"
+                $logDir = Split-Path $logPath -Parent
+                if (-not (Test-Path $logDir)) {
+                    New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+                }
+                $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Installed (isolated): $($moduleInfo.Name) v$($moduleInfo.Version)"
+                Add-Content -Path $logPath -Value $logEntry -ErrorAction SilentlyContinue
+                
+                Write-Information "Successfully installed module '$($moduleInfo.Name)' version $($moduleInfo.Version) with true isolation" -InformationAction Continue
+                
+            } catch {
+                Write-Error "Failed to install module '$Name': $_"
+            }
+        }
+    }
+}
+
+# ========================================
+# UPDATED FILE: Public/Activate-PSVirtualEnv.ps1
+# ========================================
+
+function Activate-PSVirtualEnv {
+    <#
+    .SYNOPSIS
+        Activates a PowerShell virtual environment with true isolation.
+    #>
+    [CmdletBinding()]
+    [OutputType([void])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Name,
+        
+        [Parameter()]
+        [ValidateSet('Session', 'Global')]
+        [string]$Scope = 'Session'
+    )
+    
+    begin {
+        Write-Verbose "Activating PowerShell virtual environment with true isolation: $Name"
+    }
+    
+    process {
+        # Check if another environment is already active
+        if (Test-EnvironmentActive) {
+            $activeEnv = Get-ActiveEnvironment
+            Write-Warning "Environment '$($activeEnv.Name)' is currently active. Deactivating it first."
+            Deactivate-PSVirtualEnv
+        }
+        
+        # Get environment from registry
+        $environment = Get-EnvironmentFromRegistry -Name $Name
+        
+        if (-not $environment) {
+            Write-Error "Environment '$Name' not found. Use Get-PSVirtualEnv to list available environments."
+            return
+        }
+        
+        # Verify environment path exists
+        if (-not (Test-Path $environment.Path)) {
+            Write-Error "Environment path '$($environment.Path)' does not exist. The environment may be corrupted."
+            return
+        }
+        
+        try {
+            # Store original PSModulePath
+            $script:OriginalPSModulePath = $env:PSModulePath
+            Write-Verbose "Stored original PSModulePath"
+            
+            # Initialize isolated operations
+            Initialize-IsolatedOperations
+            
+            # Set strict isolation
+            Set-VirtualEnvironmentIsolation -EnvironmentPath $environment.Path
+            
+            # Store original prompt function
+            $script:OriginalPromptFunction = (Get-Command prompt -ErrorAction SilentlyContinue).ScriptBlock
+            
+            # Update prompt to show active environment
+            $promptFunction = {
+                if ($script:ActiveEnvironment) {
+                    Write-Host "($($script:ActiveEnvironment.Name)) " -NoNewline -ForegroundColor Green
+                }
+                if ($script:OriginalPromptFunction) {
+                    & $script:OriginalPromptFunction
+                } else {
+                    "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "
+                }
+            }
+            
+            Set-Item -Path function:prompt -Value $promptFunction
+            Write-Verbose "Updated prompt function"
+            
+            # Set active environment
+            $script:ActiveEnvironment = @{
+                Name = $environment.Name
+                Path = $environment.Path
+                OriginalPath = $script:OriginalPSModulePath
+            }
+            
+            # Log activation
+            $logPath = Join-Path $environment.Path "Logs\activation.log"
+            $logDir = Split-Path $logPath -Parent
+            if (-not (Test-Path $logDir)) {
+                New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+            }
+            $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Environment activated with true isolation by $env:USERNAME"
+            Add-Content -Path $logPath -Value $logEntry -ErrorAction SilentlyContinue
+            
+            Write-Information "Successfully activated virtual environment '$Name' with TRUE ISOLATION" -InformationAction Continue
+            Write-Information "Only modules installed in this environment will be available" -InformationAction Continue
+            Write-Information "Use Install-PSModuleInEnv to add modules to this environment" -InformationAction Continue
+            
+        } catch {
+            Write-Error "Failed to activate virtual environment: $_"
+            
+            # Rollback changes
+            try {
+                Remove-VirtualEnvironmentIsolation
+                if ($script:OriginalPSModulePath) {
+                    $env:PSModulePath = $script:OriginalPSModulePath
+                    $script:OriginalPSModulePath = $null
+                }
+                $script:ActiveEnvironment = $null
+            } catch {
+                Write-Warning "Failed to properly rollback activation changes: $_"
+            }
+        }
+    }
+}
+
+# ========================================
+# UPDATED FILE: Public/Deactivate-PSVirtualEnv.ps1
+# ========================================
+
+function Deactivate-PSVirtualEnv {
+    <#
+    .SYNOPSIS
+        Deactivates the currently active PowerShell virtual environment.
+    #>
+    [CmdletBinding()]
+    [OutputType([void])]
+    param()
+    
+    begin {
+        Write-Verbose "Deactivating PowerShell virtual environment"
+    }
+    
+    process {
+        # Check if any environment is active
+        if (-not (Test-EnvironmentActive)) {
+            Write-Warning "No virtual environment is currently active."
+            return
+        }
+        
+        $activeEnv = Get-ActiveEnvironment
+        
+        try {
+            # Remove isolation
+            Remove-VirtualEnvironmentIsolation
+            
+            # Restore original prompt function
+            if ($script:OriginalPromptFunction) {
+                Set-Item -Path function:prompt -Value $script:OriginalPromptFunction
+                $script:OriginalPromptFunction = $null
+                Write-Verbose "Restored original prompt function"
+            } else {
+                # Set default prompt if no original was stored
+                Set-Item -Path function:prompt -Value {
+                    "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "
+                }
+            }
+            
+            # Log deactivation
+            $environment = Get-EnvironmentFromRegistry -Name $activeEnv.Name
+            if ($environment) {
+                $logPath = Join-Path $environment.Path "Logs\activation.log"
+                $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Environment deactivated (isolation removed) by $env:USERNAME"
+                Add-Content -Path $logPath -Value $logEntry -ErrorAction SilentlyContinue
+            }
+            
+            # Clear active environment
+            $envName = $script:ActiveEnvironment.Name
+            $script:ActiveEnvironment = $null
+            
+            Write-Information "Successfully deactivated virtual environment '$envName' and restored system access" -InformationAction Continue
+            
+        } catch {
+            Write-Error "Failed to deactivate virtual environment: $_"
+        }
+    }
+}
+
+# ========================================
+# NEW FILE: Public/Import-PSModuleInEnv.ps1
+# ========================================
+
+function Import-PSModuleInEnv {
+    <#
+    .SYNOPSIS
+        Imports a module from the active virtual environment.
+        
+    .DESCRIPTION
+        Imports a module specifically from the virtual environment, ensuring
+        it doesn't conflict with or load from system locations.
+        
+    .PARAMETER Name
+        Module name to import.
+        
+    .PARAMETER Force
+        Force import even if already loaded.
+        
+    .PARAMETER Global
+        Import to global scope.
+        
+    .PARAMETER PassThru
+        Return the module info.
+        
+    .EXAMPLE
+        Import-PSModuleInEnv -Name "Pester"
+        Imports Pester from the active virtual environment.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Name,
+        
+        [Parameter()]
+        [switch]$Force,
+        
+        [Parameter()]
+        [switch]$Global,
+        
+        [Parameter()]
+        [switch]$PassThru
+    )
+    
+    begin {
+        Write-Verbose "Importing module '$Name' from virtual environment"
+        
+        # Verify environment is active
+        if (-not (Test-EnvironmentActive)) {
+            throw "No virtual environment is active. Use Activate-PSVirtualEnv to activate an environment first."
+        }
+    }
+    
+    process {
+        $activeEnv = Get-ActiveEnvironment
+        $environment = Get-EnvironmentFromRegistry -Name $activeEnv.Name
+        
+        if (-not $environment) {
+            Write-Error "Active environment configuration not found. The environment may be corrupted."
+            return
+        }
+        
+        try {
+            $result = Import-ModuleFromEnvironment -Name $Name -EnvironmentPath $environment.Path -Force:$Force -Global:$Global -PassThru:$PassThru
+            
+            Write-Information "Successfully imported '$Name' from virtual environment" -InformationAction Continue
+            
+            if ($PassThru) {
+                return $result
+            }
+            
+        } catch {
+            Write-Error "Failed to import module '$Name' from virtual environment: $_"
+        }
+    }
+}

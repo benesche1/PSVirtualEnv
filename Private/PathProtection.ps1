@@ -28,13 +28,15 @@ function Initialize-SystemModulePaths {
                 (Join-Path $env:ProgramFiles 'PowerShell\7\Modules'),
                 (Join-Path $env:windir 'system32\WindowsPowerShell\v1.0\Modules')
             )
-        } else {
+        }
+        else {
             $systemPaths += @(
                 '/usr/local/share/powershell/Modules',
                 '/opt/microsoft/powershell/7/Modules'
             )
         }
-    } else {
+    }
+    else {
         # Windows PowerShell
         $systemPaths += @(
             (Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'),
@@ -86,52 +88,25 @@ function Enable-PSModulePathProtection {
     $script:PathCheckTimer.Interval = 200
     $script:PathCheckTimer.AutoReset = $true
     
-    # Register the smart event handler
+    # FIX: Simplified event action. It no longer tries to be "smart" about the path's content.
+    # Its only job is to restore the path if it's wrong AND a bypass is not active.
     $eventAction = {
-        # Skip protection if we're in a temporary bypass
+        # If a temporary bypass is active, do nothing.
         if ($script:TemporaryPathBypass) {
-            # Check if bypass has expired (after 5 seconds)
-            if ($script:BypassStartTime -and ((Get-Date) - $script:BypassStartTime).TotalSeconds -gt 5) {
-                $script:TemporaryPathBypass = $false
-                $script:BypassStartTime = $null
-                Write-Verbose "Temporary path bypass expired, resuming protection"
-            } else {
-                return # Still in bypass period
-            }
+            return
         }
-        
+
+        # If protection is active and the path is wrong, fix it.
         if ($script:PathProtectionActive -and $env:PSModulePath -ne $script:ProtectedPSModulePath) {
-            # Check if the current path includes critical system modules
-            $currentPath = $env:PSModulePath
-            $hasEssentialPaths = $false
-            
-            # Check if PowerShellGet path is included (essential for module operations)
-            $systemPaths = Initialize-SystemModulePaths
-            foreach ($sysPath in $systemPaths) {
-                if ($currentPath -like "*$sysPath*") {
-                    $hasEssentialPaths = $true
-                    break
-                }
-            }
-            
-            # Only restore if the change doesn't include essential system paths
-            # This allows legitimate module operations to proceed
-            if (-not $hasEssentialPaths) {
-                Write-Verbose "PSModulePath was modified inappropriately, restoring protected path"
-                $env:PSModulePath = $script:ProtectedPSModulePath
-            } else {
-                Write-Verbose "PSModulePath includes essential system paths, allowing temporary access"
-                # Set a temporary bypass to prevent immediate restoration
-                $script:TemporaryPathBypass = $true
-                $script:BypassStartTime = Get-Date
-            }
+            Write-Verbose "PSModulePath was modified outside of a bypass, restoring protected path."
+            $env:PSModulePath = $script:ProtectedPSModulePath
         }
+    
+        Register-ObjectEvent -InputObject $script:PathCheckTimer -EventName Elapsed -Action $eventAction | Out-Null
+        $script:PathCheckTimer.Start()
+    
+        Write-Verbose "Smart PSModulePath protection enabled with path: $ProtectedPath"
     }
-    
-    Register-ObjectEvent -InputObject $script:PathCheckTimer -EventName Elapsed -Action $eventAction | Out-Null
-    $script:PathCheckTimer.Start()
-    
-    Write-Verbose "Smart PSModulePath protection enabled with path: $ProtectedPath"
 }
 
 function Request-TemporaryPathBypass {
